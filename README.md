@@ -62,6 +62,8 @@ API_KEY=troque-por-uma-chave-forte      # obrigatória, o servidor não sobe sem
 RECONNECT_MAX_ATTEMPTS=5                # tentativas de reconexão automática após queda
 RECONNECT_DELAY_MS=30000                # espera fixa entre cada tentativa (30s)
 CONNECTING_TIMEOUT_MS=45000             # força /disconnect sozinho se travar em "connecting" (0 desativa)
+BAILEYS_LOG_LEVEL=warn                  # logs internos do baileys (pino JSON): fatal|error|warn|info|debug|trace|silent
+CONNECTION_EVENTS_RETENTION_DAYS=30     # quantos dias guardar o histórico de quedas (wa_connection_events)
 JSON_BODY_LIMIT=20mb                    # limite do body JSON nas rotas de mídia (/messages, /message/sendButtons); as demais aceitam até 256kb
 MESSAGE_STATUS_TIMEOUT_MS=8000          # quanto tempo /messages espera pela confirmação real de entrega (0 desativa)
 SERVER_URL=                             # URL pública da bridge, vai no "server_url" dos webhooks (vazio = null)
@@ -150,8 +152,10 @@ Todos abaixo (exceto `/health`) exigem `x-api-key` no header.
 | POST   | `/sessions/:id/connect`      | Conecta/reconecta o número `:id`. Cria sessão nova se não existir.         |
 | GET    | `/sessions/:id/qr`           | QR code (base64 PNG) pra parear, ou status atual se já conectado.          |
 | GET    | `/sessions`                  | Lista todas as sessões (persistidas no banco) e seus status.               |
-| POST   | `/sessions/:id/disconnect`   | Fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR.     |
-| DELETE | `/sessions/:id`              | Logout definitivo: invalida no WhatsApp e apaga as credenciais do banco.   |
+| POST   | `/sessions/:id/disconnect`   | Pausa: fecha a conexão mas **mantém** as credenciais — reconecta sem novo QR. |
+| POST   | `/sessions/:id/logout`       | Desvincula o aparelho no WhatsApp e apaga as credenciais, mas **mantém** a sessão, os webhooks e o histórico — o próximo `/connect` gera QR novo. |
+| DELETE | `/sessions/:id`              | Exclui a sessão: logout + apaga credenciais, webhooks, histórico e entregas (cascade). |
+| GET    | `/sessions/:id/connection-events?limit=100` | Histórico de aberturas/quedas/logouts com o motivo (ver "Diagnóstico de quedas"). |
 | POST   | `/sessions/:id/messages`     | Dispara mensagem — texto, imagem, vídeo, documento ou áudio, a um número ou grupo (ver formato abaixo). |
 | POST   | `/sessions/:id/message/sendList`    | Lista de opções — mesmo payload do `/message/sendList` da Evolution API. |
 | POST   | `/sessions/:id/message/sendButtons` | Botões — mesmo payload do `/message/sendButtons` da Evolution API.     |
@@ -458,7 +462,15 @@ curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/d
 # 5. reconecta usando a credencial salva
 curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/connect
 
-# 6. logout definitivo (precisa escanear QR de novo pra usar esse número)
+# 6. logout: desvincula o aparelho e apaga as credenciais, mas mantém a
+#    sessão e os webhooks (o próximo /connect pede QR de novo)
+curl -X POST -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999/logout
+# -> {"id":"5511999999999","status":"logged_out","remoteLogout":true}
+#    remoteLogout=false: não havia socket conectado pra avisar o WhatsApp; as
+#    credenciais foram apagadas mesmo assim (o aparelho pode continuar listado
+#    no celular até ser removido lá ou expirar)
+
+# 7. exclui a sessão de vez (logout + apaga webhooks, histórico e entregas)
 curl -X DELETE -H "x-api-key: $KEY" http://localhost:3000/sessions/5511999999999
 ```
 
@@ -755,7 +767,7 @@ normalmente e o log avisa que a tela está indisponível.
 `connecting` → `disconnected` (travou em `connecting` por mais que `CONNECTING_TIMEOUT_MS` — watchdog força a saída, **sem** reconexão automática, igual a um `/disconnect` manual)
 `connected`/`qr` → `reconnecting` (queda de rede — não solicitada — tenta sozinho)
 `reconnecting` → `error` (desistiu após `RECONNECT_MAX_ATTEMPTS` tentativas — chame `/connect` de novo)
-qualquer → `logged_out` (deslogado pelo próprio WhatsApp ou via `DELETE`, credenciais apagadas)
+qualquer → `logged_out` (deslogado pelo próprio WhatsApp ou via `/logout`, credenciais apagadas; a sessão e os webhooks ficam)
 
 **Sessão travada em `connecting` ou `connected`?** Chame `/disconnect` e
 depois `/connect` — `/disconnect` funciona mesmo se o socket estiver morto/
@@ -765,11 +777,41 @@ sem resposta (encerrar um socket já fechado é um no-op seguro). Se ficar em
 `/disconnect`, de propósito **não** reconecta em seguida (ver decisões de
 design abaixo).
 
+## Diagnóstico de quedas
+
+Toda abertura (`open`), queda não pedida (`close`), `/disconnect` ou watchdog
+(`disconnect`) e `/logout` (`logout`) fica registrada com o motivo que o
+baileys reportou, em dois lugares:
+
+- **Log do container**, uma linha por queda:
+  `[5511999999999] conexão fechou: code=428 reason=connectionClosed message="Connection Terminated" uptime=52m05s`
+- **Tabela `wa_connection_events`** (sobrevive a redeploy; limpeza após
+  `CONNECTION_EVENTS_RETENTION_DAYS`, default 30), consultável pela API:
+  `GET /sessions/:id/connection-events?limit=100`.
+
+Como ler o `code`/`reason` (`DisconnectReason` do baileys):
+
+| code | reason | O que costuma ser |
+|------|--------|-------------------|
+| 408 | `connectionLost/timedOut` | Keepalive sem resposta: rede da VPS ou do WhatsApp oscilou. |
+| 428 | `connectionClosed` | WebSocket fechado pelo outro lado (o WhatsApp encerrou a conexão). |
+| 440 | `connectionReplaced` | Outra conexão com a mesma credencial abriu (dois processos/sockets com o mesmo número). |
+| 401 | `loggedOut` | Aparelho removido no celular ou sessão invalidada pelo WhatsApp: precisa de QR. |
+| 500 | `badSession` | Credencial/sessão corrompida. |
+| 503 | `unavailableService` | Instabilidade do lado do WhatsApp. |
+| 515 | `restartRequired` | Normal logo depois de ler o QR; a bridge reconecta na hora. |
+
+Os logs internos do baileys saem em JSON (pino) com `"session":"<id>"`, no
+nível `BAILEYS_LOG_LEVEL` (default `warn`). Pra investigar uma instância que
+cai com frequência, suba temporariamente pra `info` ou `debug`. Os dumps de
+sessão de sinal que o libsignal imprimia (`Closing session: SessionEntry {...}`,
+com chaves privadas) são descartados.
+
 ## Decisões de design (e o que falta pra produção séria)
 
 - **Reconexão automática só em queda não solicitada**, com quantidade de
   tentativas e delay fixo entre elas configuráveis via `RECONNECT_MAX_ATTEMPTS`
-  e `RECONNECT_DELAY_MS`. Uma desconexão pedida via `/disconnect` ou `DELETE`
+  e `RECONNECT_DELAY_MS`. Uma desconexão pedida via `/disconnect`, `/logout` ou `DELETE`
   nunca acorda reconexão sozinha — só volta se você chamar `/connect`.
 - **Watchdog de `connecting` travado** (`CONNECTING_TIMEOUT_MS`, default
   45s): se o handshake com o WhatsApp nunca completar nem falhar (comum

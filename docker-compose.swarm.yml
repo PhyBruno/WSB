@@ -70,6 +70,9 @@ services:
       - WEBHOOK_HEADERS_KEY=${WEBHOOK_HEADERS_KEY:-}
       ## Histórico de mensagens: apaga as com mais de N dias (0 = guarda pra sempre)
       - MESSAGE_RETENTION_DAYS=${MESSAGE_RETENTION_DAYS:-0}
+      ## Diagnóstico de quedas: nível dos logs do baileys e dias de wa_connection_events
+      - BAILEYS_LOG_LEVEL=${BAILEYS_LOG_LEVEL:-warn}
+      - CONNECTION_EVENTS_RETENTION_DAYS=${CONNECTION_EVENTS_RETENTION_DAYS:-30}
       ## Nome dos grupos (groupSubject): cache em memória, consulta ao WhatsApp e limites do histórico
       - GROUP_METADATA_TTL_MS=${GROUP_METADATA_TTL_MS:-21600000}
       - GROUP_METADATA_FAILURE_TTL_MS=${GROUP_METADATA_FAILURE_TTL_MS:-300000}
