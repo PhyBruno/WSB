@@ -122,3 +122,25 @@ CREATE INDEX IF NOT EXISTS wa_webhook_deliveries_claim_idx
 
 CREATE INDEX IF NOT EXISTS wa_webhook_deliveries_webhook_idx
   ON wa_webhook_deliveries (webhook_id, id DESC);
+
+-- Aberturas, quedas e logouts de cada sessão, com o motivo que o baileys
+-- reportou (DisconnectReason). Existe pra investigar quedas "do nada": os
+-- logs do container somem a cada redeploy, isto aqui fica (limpeza por
+-- CONNECTION_EVENTS_RETENTION_DAYS). Consulta: GET /sessions/:id/connection-events.
+CREATE TABLE IF NOT EXISTS wa_connection_events (
+  id          BIGSERIAL PRIMARY KEY,
+  session_id  TEXT NOT NULL REFERENCES wa_sessions(id) ON DELETE CASCADE,
+  event       TEXT NOT NULL,           -- open | close (queda não pedida) | disconnect (/disconnect ou watchdog) | logout
+  status_code INT,                     -- código do lastDisconnect (ex.: 428, 408, 440, 401, 500, 515)
+  reason      TEXT,                    -- nome no DisconnectReason (ex.: connectionClosed)
+  message     TEXT,                    -- mensagem do erro (truncada)
+  detail      TEXT,                    -- Boom.data em JSON (ex.: nó <stream:error>), truncado
+  uptime_ms   BIGINT,                  -- quanto tempo ficou conectada antes de cair
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS wa_connection_events_session_idx
+  ON wa_connection_events (session_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS wa_connection_events_created_idx
+  ON wa_connection_events (created_at);

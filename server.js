@@ -48,10 +48,31 @@ import {
   decodeBase64Media,
   createSendMessageHandler
 } from './outbound.js'
+import {
+  describeDisconnect,
+  formatCloseLog,
+  createConnectionEventStore,
+  silenceSignalSessionDumps
+} from './connectionEvents.js'
+import { createSessionLogout } from './sessionLogout.js'
+
+// Antes de qualquer sessão abrir: o libsignal despeja chaves privadas no
+// stdout a cada sessão de sinal (ver connectionEvents.js).
+silenceSignalSessionDumps()
 
 const PORT = process.env.PORT || 3000
 const API_KEY = process.env.API_KEY
-const logger = pino({ level: 'silent' }) // troque para 'info' se quiser ver os logs internos do baileys
+
+// Logs internos do baileys (pino, JSON no stdout). 'warn' mostra erros de
+// socket/keepalive/decrypt sem o volume do 'info'; pra investigar uma queda
+// específica suba pra 'info' ou 'debug' temporariamente. 'silent' desliga.
+const BAILEYS_LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']
+const BAILEYS_LOG_LEVEL = (process.env.BAILEYS_LOG_LEVEL || 'warn').trim().toLowerCase()
+if (!BAILEYS_LOG_LEVELS.includes(BAILEYS_LOG_LEVEL)) {
+  console.error(`ERRO: BAILEYS_LOG_LEVEL precisa ser um de: ${BAILEYS_LOG_LEVELS.join(', ')}.`)
+  process.exit(1)
+}
+const logger = pino({ level: BAILEYS_LOG_LEVEL, base: undefined, timestamp: pino.stdTimeFunctions.isoTime })
 
 if (!API_KEY) {
   console.error('ERRO: defina a variável de ambiente API_KEY antes de subir a bridge.')
@@ -170,6 +191,11 @@ if (WEBHOOK_HEADERS_KEY !== null && WEBHOOK_HEADERS_KEY.length < 16) {
 // limpeza horária apaga mensagens gravadas há mais de N dias. Não é default
 // pra não apagar histórico de quem já conta com ele.
 const MESSAGE_RETENTION_DAYS = numberFromEnv('MESSAGE_RETENTION_DAYS', 0, { min: 0, integer: true })
+
+// wa_connection_events (aberturas/quedas/logouts com o motivo): poucas linhas
+// por dia por sessão, então 30 dias cobre a investigação de um padrão de
+// quedas sem crescer à toa. Limpeza horária, junto com a de mensagens.
+const CONNECTION_EVENTS_RETENTION_DAYS = numberFromEnv('CONNECTION_EVENTS_RETENTION_DAYS', 30, { min: 1, integer: true })
 
 // Nome dos grupos (data.groupSubject nos webhooks e no histórico), em cache
 // de memória → wa_groups → consulta ao WhatsApp (groupMetadata.js). Defaults
@@ -551,6 +577,23 @@ function startSessionSerialized(id) {
   return promise
 }
 
+const connectionEvents = createConnectionEventStore({ pool })
+
+const logoutSession = createSessionLogout({
+  sessions,
+  sessionExists: async (id) => {
+    const { rowCount } = await pool.query('SELECT 1 FROM wa_sessions WHERE id = $1', [id])
+    return rowCount > 0
+  },
+  wipeAuthState,
+  setSessionStatus: (id, status) => setSessionStatus(id, status),
+  clearSessionTimers: (id) => {
+    clearReconnectTimer(id)
+    clearConnectingWatchdog(id)
+    reconnectAttempts.delete(id)
+  }
+})
+
 async function setSessionStatus(id, status, jid = undefined, name = undefined) {
   await pool.query(
     `UPDATE wa_sessions SET status = $2, jid = COALESCE($3, jid), name = COALESCE($4, name), updated_at = now() WHERE id = $1`,
@@ -593,6 +636,7 @@ async function startSession(id) {
   }
   sessions.set(id, entry)
 
+  const sessionLogger = logger.child({ session: id })
   const sock = makeWASocket({
     // Só inclui a chave se já resolvemos uma versão — deixar `version: undefined`
     // explícito pisaria no default interno do baileys (o spread do makeWASocket
@@ -606,9 +650,10 @@ async function startSession(id) {
     // isso é resolvido só atualizando o pacote, sem tocar no nosso código.
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger)
+      keys: makeCacheableSignalKeyStore(state.keys, sessionLogger)
     },
-    logger,
+    // Cada linha do baileys sai com {"session":"<id>"}, pra filtrar por número.
+    logger: sessionLogger,
     browser: Browsers.ubuntu('Bridge API'),
     // A bridge recebe as mensagens NOVAS (messages.upsert → wa_messages →
     // webhooks), mas não importa o histórico antigo de conversas. O default
@@ -748,20 +793,48 @@ async function startSession(id) {
       // ponto — quem realmente captura o nome pra esse caso é o listener de
       // 'creds.update' registrado acima (ver comentário lá).
       entry.name = sock.user?.name ?? null
+      entry.connectedAt = Date.now()
       reconnectAttempts.set(id, 0)
       clearConnectingWatchdog(id)
       groups.onConnected(id)
       await setSessionStatus(id, 'connected', entry.jid, entry.name)
       console.log(`[${id}] conectado como ${entry.jid} (${entry.name ?? 'sem nome de perfil'})`)
+      connectionEvents.record(id, 'open')
     }
 
     if (connection === 'close') {
       clearConnectingWatchdog(id)
+
+      // Toda queda deixa rastro com o motivo (log + wa_connection_events),
+      // inclusive as intencionais — é o que permite investigar depois uma
+      // instância que "caiu do nada".
+      const closeInfo = describeDisconnect(lastDisconnect)
+      const uptimeMs = entry.connectedAt ? Date.now() - entry.connectedAt : undefined
+      entry.connectedAt = undefined
+      console.log(
+        formatCloseLog(id, closeInfo, uptimeMs) +
+          (entry.intentionalDisconnect ? ` intentional=${entry.intentionalStatus ?? 'disconnected'}` : '')
+      )
+      // close = queda NÃO pedida (o que se quer investigar); disconnect =
+      // /disconnect ou watchdog; logout = /logout. DELETE não grava (a linha
+      // da sessão está sendo apagada).
+      if (entry.intentionalStatus !== 'removed') {
+        const event =
+          entry.intentionalStatus === 'logged_out' ? 'logout' : entry.intentionalDisconnect ? 'disconnect' : 'close'
+        connectionEvents.record(id, event, { ...closeInfo, uptimeMs })
+      }
+
       if (entry.intentionalDisconnect) {
-        entry.status = 'disconnected'
-        await setSessionStatus(id, 'disconnected')
-        clearReconnectTimer(id)
-        console.log(`[${id}] desconectado (intencional, sem reconexão automática)`)
+        const finalStatus = entry.intentionalStatus ?? 'disconnected'
+        entry.status = finalStatus
+        // Só a sessão atual grava no banco: o close atrasado de um socket já
+        // substituído (logout seguido de /connect, ou /disconnect e /connect
+        // em sequência) sobrescreveria o status da sessão nova.
+        if (isCurrent) {
+          await setSessionStatus(id, finalStatus)
+          clearReconnectTimer(id)
+        }
+        console.log(`[${id}] desconectado (intencional: ${finalStatus}, sem reconexão automática)`)
         return
       }
 
@@ -951,6 +1024,27 @@ app.post('/sessions/:id/disconnect', async (req, res) => {
   res.json({ id, status: 'disconnecting' })
 })
 
+// Logout: desvincula o aparelho no WhatsApp e apaga as credenciais, mas
+// MANTÉM a sessão, os webhooks e o histórico. O próximo /connect gera QR novo.
+// (O /disconnect acima só pausa; o DELETE abaixo apaga tudo.)
+app.post('/sessions/:id/logout', async (req, res) => {
+  const id = normalizeNumber(req.params.id)
+  const result = await logoutSession(id)
+  if (!result) return res.status(404).json({ error: 'sessão não encontrada' })
+  console.log(`[${id}] logout via API (remoteLogout=${result.remoteLogout}), credenciais apagadas`)
+  res.json(result)
+})
+
+// Histórico de aberturas/quedas/logouts com o motivo (diagnóstico de quedas).
+app.get('/sessions/:id/connection-events', async (req, res) => {
+  const id = normalizeNumber(req.params.id)
+  const limit = req.query.limit === undefined ? 100 : Number(req.query.limit)
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    return res.status(400).json({ error: 'limit precisa ser um inteiro entre 1 e 1000' })
+  }
+  res.json(await connectionEvents.list(id, limit))
+})
+
 // Retorna o QR code (base64) para parear, ou o status atual da sessão
 app.get('/sessions/:id/qr', async (req, res) => {
   const id = normalizeNumber(req.params.id)
@@ -983,6 +1077,9 @@ app.delete('/sessions/:id', async (req, res) => {
 
   if (entry) {
     entry.intentionalDisconnect = true
+    // A linha da sessão vai ser apagada: o handler de close não grava evento
+    // (a FK de wa_connection_events falharia) nem status.
+    entry.intentionalStatus = 'removed'
     try {
       // logout() manda a stanza remove-companion-device pro WhatsApp e só
       // fecha o socket (end()) DEPOIS disso ter ido pro ar. Se esse envio
@@ -1198,6 +1295,25 @@ function startMessageRetention() {
   setInterval(purge, 60 * 60_000).unref()
 }
 
+// Limpeza horária de wa_connection_events. Mesmo cuidado da de mensagens:
+// erro só é logado.
+function startConnectionEventsRetention() {
+  const purge = async () => {
+    try {
+      const removed = await connectionEvents.purgeOlderThan(CONNECTION_EVENTS_RETENTION_DAYS)
+      if (removed) {
+        console.log(
+          `eventos de conexão: ${removed} registro(s) com mais de ${CONNECTION_EVENTS_RETENTION_DAYS} dia(s) removido(s)`
+        )
+      }
+    } catch (err) {
+      console.error(`eventos de conexão: falha na limpeza: ${err.message}`)
+    }
+  }
+  purge()
+  setInterval(purge, 60 * 60_000).unref()
+}
+
 async function main() {
   // migrate() TEM que terminar antes do listen(): senão uma requisição pode
   // chegar e consultar tabelas que ainda não existem.
@@ -1210,6 +1326,7 @@ async function main() {
   // sessões: entregas que sobraram de antes do restart já voltam a sair.
   dispatcher.start()
   if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()
+  startConnectionEventsRetention()
   // Bounded pelo timeout interno de resolveBaileysVersion — nunca trava o
   // boot indefinidamente mesmo se o GitHub estiver inacessível.
   await resolveBaileysVersion()
