@@ -57,6 +57,7 @@ import {
 import { createSessionLogout } from './sessionLogout.js'
 import { createMemoryMonitor } from './memoryMonitor.js'
 import { createConcurrencyLimiter, createUploadGate } from './limiter.js'
+import { HISTORY_SYNC_MODES, historySyncFilter, historySyncTypeName } from './historySync.js'
 
 // Antes de qualquer sessão abrir: o libsignal despeja chaves privadas no
 // stdout a cada sessão de sinal (ver connectionEvents.js).
@@ -236,6 +237,21 @@ if (MEMORY_WARN_RATIO > 1) {
 // disso recebe 503 com Retry-After. Envio de texto (corpo pequeno) não entra.
 const MEDIA_UPLOAD_CONCURRENCY = numberFromEnv('MEDIA_UPLOAD_CONCURRENCY', 5, { min: 1, integer: true })
 const MEDIA_UPLOAD_QUEUE_TIMEOUT_MS = numberFromEnv('MEDIA_UPLOAD_QUEUE_TIMEOUT_MS', 30_000, { min: 0 })
+// POST /chat/getBase64FromMediaMessage montando a resposta ao mesmo tempo
+// (download + base64 + JSON, ~4x o arquivo cada). Mesma fila e o mesmo 503
+// dos envios, com o mesmo MEDIA_UPLOAD_QUEUE_TIMEOUT_MS.
+const MEDIA_BASE64_CONCURRENCY = numberFromEnv('MEDIA_BASE64_CONCURRENCY', 3, { min: 1, integer: true })
+
+// Quais pacotes da sincronização de histórico o Baileys baixa (historySync.js).
+// minimal (default) descarta o histórico de mensagens — a bridge não o usa e
+// era ele que estourava o heap logo depois de parear —, mas mantém os pacotes
+// pequenos com os mapeamentos LID→número e os nomes de contato.
+const HISTORY_SYNC = (process.env.HISTORY_SYNC || 'minimal').trim().toLowerCase()
+if (!HISTORY_SYNC_MODES[HISTORY_SYNC]) {
+  console.error(`ERRO: HISTORY_SYNC precisa ser um de: ${Object.keys(HISTORY_SYNC_MODES).join(', ')}.`)
+  process.exit(1)
+}
+const shouldSyncHistoryMessage = historySyncFilter(HISTORY_SYNC)
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
 // SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
@@ -516,6 +532,7 @@ const dispatcher = createDispatcher({
 const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
 
 const uploadSlots = createConcurrencyLimiter({ max: MEDIA_UPLOAD_CONCURRENCY })
+const base64Slots = createConcurrencyLimiter({ max: MEDIA_BASE64_CONCURRENCY })
 
 const memoryMonitor = createMemoryMonitor({
   intervalMs: MEMORY_LOG_INTERVAL_MS,
@@ -534,7 +551,8 @@ const memoryMonitor = createMemoryMonitor({
       media: media.stats(),
       groups: groups.stats(),
       dispatcher: dispatcher.stats(),
-      uploads: uploadSlots.stats()
+      uploads: uploadSlots.stats(),
+      base64: base64Slots.stats()
     }
   }
 })
@@ -712,6 +730,10 @@ async function startSession(id) {
     // completo a cada pareamento novo, o que custa tempo e banda à toa e
     // dispararia avisos de webhook de mensagens velhas.
     syncFullHistory: false,
+    // syncFullHistory só controla o pedido de histórico COMPLETO (FULL). O
+    // histórico recente (RECENT) continuava vindo e era o que estourava o
+    // heap: ver historySync.js e HISTORY_SYNC.
+    shouldSyncHistoryMessage,
     // getMessage: a documentação do baileys trata isso como praticamente
     // obrigatório — é o que permite reenviar uma mensagem quando o WhatsApp
     // pede retry (evita mensagens travadas em "this message can take a
@@ -774,7 +796,8 @@ async function startSession(id) {
     memoryMonitor.count(id, 'history', amounts)
     console.log(
       `[${id}] histórico recebido: mensagens=${amounts.messages} conversas=${amounts.chats} ` +
-        `contatos=${amounts.contacts} syncType=${syncType ?? 'n/a'} progresso=${progress ?? 'n/a'}`
+        `contatos=${amounts.contacts} syncType=${syncType == null ? 'n/a' : historySyncTypeName(syncType)} ` +
+        `progresso=${progress ?? 'n/a'}`
     )
   })
 
@@ -1057,7 +1080,17 @@ app.use('/sessions', (req, res, next) => {
 // que vir depois do middleware acima: herda a exigência de x-api-key.
 app.use(
   '/sessions/:id',
-  webhookRoutes({ sessions, pool, webhooks, dispatcher, media, groups, historyLimits: GROUP_HISTORY_LIMITS })
+  webhookRoutes({
+    sessions,
+    pool,
+    webhooks,
+    dispatcher,
+    media,
+    groups,
+    historyLimits: GROUP_HISTORY_LIMITS,
+    base64Slots,
+    base64QueueTimeoutMs: MEDIA_UPLOAD_QUEUE_TIMEOUT_MS
+  })
 )
 
 // Conecta (ou reconecta) uma sessão. O :id é o número, só dígitos com DDI.
@@ -1400,6 +1433,7 @@ async function main() {
   // sessões: entregas que sobraram de antes do restart já voltam a sair.
   dispatcher.start()
   memoryMonitor.start()
+  console.log(`histórico do WhatsApp: HISTORY_SYNC=${HISTORY_SYNC} (ver historySync.js)`)
   // Listas de participantes vencidas (metadataTtlMs) saem da memória.
   setInterval(() => groups.sweep(), 60_000).unref()
   if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()

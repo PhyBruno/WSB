@@ -41,6 +41,8 @@ services:
       ## Envios com mídia (corpo grande) processados ao mesmo tempo e espera máxima na fila (depois, 503)
       - MEDIA_UPLOAD_CONCURRENCY=${MEDIA_UPLOAD_CONCURRENCY:-5}
       - MEDIA_UPLOAD_QUEUE_TIMEOUT_MS=${MEDIA_UPLOAD_QUEUE_TIMEOUT_MS:-30000}
+      ## getBase64FromMediaMessage montando a resposta ao mesmo tempo
+      - MEDIA_BASE64_CONCURRENCY=${MEDIA_BASE64_CONCURRENCY:-3}
       ## Banco de dados
       - DATABASE_URL=postgres://whatsapp_bridge:${POSTGRES_PASSWORD}@whatsapp_bridge_postgres:5432/whatsapp_bridge
       ## Autenticação (header x-api-key obrigatório em toda chamada)
@@ -77,6 +79,8 @@ services:
       - MESSAGE_RETENTION_DAYS=${MESSAGE_RETENTION_DAYS:-0}
       ## Diagnóstico de quedas: nível dos logs do baileys e dias de wa_connection_events
       - BAILEYS_LOG_LEVEL=${BAILEYS_LOG_LEVEL:-warn}
+      ## Histórico do WhatsApp ao parear: minimal (sem mensagens antigas, só mapeamentos LID), off ou recent
+      - HISTORY_SYNC=${HISTORY_SYNC:-minimal}
       - CONNECTION_EVENTS_RETENTION_DAYS=${CONNECTION_EVENTS_RETENTION_DAYS:-30}
       ## Nome dos grupos (groupSubject): cache em memória, consulta ao WhatsApp e limites do histórico
       - GROUP_METADATA_TTL_MS=${GROUP_METADATA_TTL_MS:-21600000}

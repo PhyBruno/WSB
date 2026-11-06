@@ -92,6 +92,9 @@ export function explainMemory(snapshot) {
   if (app.uploads && (app.uploads.active > 0 || app.uploads.waiting > 0)) {
     suspects.push(`envios com mídia pela API: ${app.uploads.active} em andamento, ${app.uploads.waiting} na fila`)
   }
+  if (app.base64 && (app.base64.active > 0 || app.base64.waiting > 0)) {
+    suspects.push(`pedidos de mídia em base64 pela API: ${app.base64.active} em andamento, ${app.base64.waiting} na fila`)
+  }
   const history = activity.history
   if (history && history.messages >= HISTORY_MESSAGES_THRESHOLD) {
     const sessions = Object.entries(history.bySession ?? {})
@@ -161,6 +164,7 @@ export function formatMemoryLine(snapshot) {
     if (app.dispatcher.media) parts.push(`webhooks-mídia=${app.dispatcher.media.active}+${app.dispatcher.media.waiting}`)
   }
   if (app.uploads) parts.push(`envios-mídia=${app.uploads.active}+${app.uploads.waiting}`)
+  if (app.base64) parts.push(`base64-mídia=${app.base64.active}+${app.base64.waiting}`)
   if (activity.upsert) parts.push(`recebidas=${activity.upsert.messages}`)
   if (activity.history) {
     parts.push(`histórico={mensagens=${activity.history.messages},conversas=${activity.history.chats},contatos=${activity.history.contacts}}`)

@@ -5,6 +5,7 @@ import { validateWebhookInput } from './webhooks.js'
 import { isMediaMessage, normalizeContentShape, unwrapMessage } from './inbound.js'
 import { buildBase64Response } from './media.js'
 import { distinctGroupJids, withGroupSubjects } from './groupMetadata.js'
+import { holdSlotForResponse } from './limiter.js'
 
 // Rotas novas por instância (contrato em
 // docs/contracts/rest-api.md), montadas em
@@ -61,7 +62,19 @@ export async function addGroupSubjects(groups, sessionId, page, limits = {}) {
   return { ...page, items: withGroupSubjects(page.items, subjects) }
 }
 
-export default function webhookRoutes({ sessions, pool, webhooks, dispatcher, media, groups = null, historyLimits = {} }) {
+export default function webhookRoutes({
+  sessions,
+  pool,
+  webhooks,
+  dispatcher,
+  media,
+  groups = null,
+  historyLimits = {},
+  // Vagas do getBase64FromMediaMessage (download + base64 + JSON da resposta,
+  // ~4x o arquivo cada). Sem limiter, sem limite.
+  base64Slots = null,
+  base64QueueTimeoutMs = 30_000
+}) {
   const router = express.Router({ mergeParams: true })
 
   // Sessão que existe no banco (viva ou não neste processo). Responde 404 e
@@ -253,6 +266,14 @@ export default function webhookRoutes({ sessions, pool, webhooks, dispatcher, me
       const entry = sessions.get(session.id)
       if (!entry || entry.status !== 'connected') {
         return res.status(409).json({ error: `sessão não está conectada (status: ${entry?.status ?? 'inativa'})` })
+      }
+
+      // A vaga vale até a resposta (com o base64) terminar de sair.
+      if (
+        base64Slots &&
+        !(await holdSlotForResponse({ limiter: base64Slots, res, timeoutMs: base64QueueTimeoutMs, label: 'pedidos de mídia em base64' }))
+      ) {
+        return
       }
 
       let buffer

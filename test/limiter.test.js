@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import express from 'express'
-import { createConcurrencyLimiter, createUploadGate, LimiterTimeoutError } from '../limiter.js'
+import { createConcurrencyLimiter, createUploadGate, holdSlotForResponse, LimiterTimeoutError } from '../limiter.js'
 
 const tick = () => new Promise((r) => setImmediate(r))
 
@@ -158,5 +158,33 @@ test('createUploadGate: cliente que desiste na fila libera o lugar', async () =>
     assert.deepEqual(srv.limiter.stats(), { active: 0, waiting: 0, max: 1 })
   } finally {
     await srv.close()
+  }
+})
+
+test('holdSlotForResponse: segura a vaga até a resposta sair e usa o rótulo no 503', async () => {
+  const limiter = createConcurrencyLimiter({ max: 1 })
+  let open
+  const gateOpen = new Promise((r) => (open = r))
+  const app = express()
+  app.get('/b', async (req, res) => {
+    if (!(await holdSlotForResponse({ limiter, res, timeoutMs: 50, label: 'pedidos de mídia em base64' }))) return
+    await gateOpen
+    res.json({ ok: true })
+  })
+  const server = await new Promise((resolve) => {
+    const s = app.listen(0, () => resolve(s))
+  })
+  const url = `http://127.0.0.1:${server.address().port}/b`
+  try {
+    const first = fetch(url)
+    while (limiter.stats().active < 1) await new Promise((r) => setTimeout(r, 10))
+    const second = await fetch(url)
+    assert.equal(second.status, 503)
+    assert.match((await second.json()).error, /muitos pedidos de mídia em base64 em andamento \(máximo 1/)
+    open()
+    assert.equal((await first).status, 200)
+    while (limiter.stats().active > 0) await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    await new Promise((r) => server.close(r))
   }
 })

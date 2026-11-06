@@ -99,7 +99,9 @@ diferenças (poucas e intencionais) estão em
 
 - Não tem regra de negócio, fila de campanhas, CRM ou chatbot.
 - Não importa o histórico antigo do aparelho: só o que chega depois que a
-  instância conecta (`syncFullHistory: false`).
+  instância conecta. Nem baixa o histórico recente que o WhatsApp oferece ao
+  parear (`HISTORY_SYNC=minimal`): só os pacotes pequenos com mapeamentos
+  LID→número e nomes de contato.
 - Não converte formatos de mídia (não há ffmpeg na imagem).
 - Não tem fila de envio: cada disparo é síncrono.
 - Não distingue consumidores: a API key é única e global.
@@ -276,7 +278,8 @@ sobe sem ela); todo o resto tem default.
 | `SERVER_URL` | vazio | URL pública da bridge; vai no campo `server_url` dos webhooks (vazio = `null`). |
 | `JSON_BODY_LIMIT` | `20mb` | Limite do body nas rotas de mídia (`/messages`, `/message/sendButtons`); as demais aceitam até 256kb. |
 | `MEDIA_UPLOAD_CONCURRENCY` | `5` | Envios com corpo grande (mídia em base64) processados ao mesmo tempo nessas rotas. Corpo até 256kb (texto) não conta. |
-| `MEDIA_UPLOAD_QUEUE_TIMEOUT_MS` | `30000` | Espera máxima na fila por uma vaga de envio; depois disso, `503` com `Retry-After` (o corpo nem é lido). |
+| `MEDIA_UPLOAD_QUEUE_TIMEOUT_MS` | `30000` | Espera máxima na fila por uma vaga de envio ou de base64; depois disso, `503` com `Retry-After` (no envio, o corpo nem é lido). |
+| `MEDIA_BASE64_CONCURRENCY` | `3` | `POST /chat/getBase64FromMediaMessage` montando a resposta ao mesmo tempo (download, base64 e JSON, ~4x o arquivo cada). O excedente espera na fila. |
 
 ### Conexão e envio
 
@@ -286,6 +289,7 @@ sobe sem ela); todo o resto tem default.
 | `RECONNECT_DELAY_MS` | `30000` | Espera fixa entre tentativas. |
 | `CONNECTING_TIMEOUT_MS` | `45000` | Watchdog: força `/disconnect` se travar em `connecting` (`0` desativa). |
 | `MESSAGE_STATUS_TIMEOUT_MS` | `8000` | Quanto `/messages` espera pela confirmação real de entrega (`0` desativa). |
+| `HISTORY_SYNC` | `minimal` | Pacotes da sincronização de histórico que o Baileys baixa: `minimal` (só mapeamentos LID→número e nomes, sem histórico de mensagens), `off` (nada; o Baileys avisa de instabilidade) ou `recent` (default do Baileys, comportamento antigo). |
 | `BAILEYS_LOG_LEVEL` | `warn` | Logs internos do Baileys (pino JSON): `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`. |
 | `CONNECTION_EVENTS_RETENTION_DAYS` | `30` | Dias de histórico em `wa_connection_events`. |
 | `NODE_MAX_OLD_SPACE_MB` | `1536` | Só do compose: vira `--max-old-space-size` (teto do heap do Node). Use ~75% do limite do container. |
@@ -984,8 +988,8 @@ Como ler:
 | `grandes` | Objetos enormes (strings/arrays). Alto = mídia em base64 ou JSON de webhook com mídia. |
 | `fora-do-heap` / `buffers` | Memória que o heap não vê: mídia baixada, criptografia. |
 | `mídia`, `grupos`, `enviadas-em-cache` | O que os caches da própria bridge seguram. |
-| `webhooks-mídia` / `envios-mídia` | Vagas de mídia ocupadas + fila: webhooks montando/enviando mídia (`WEBHOOK_MEDIA_CONCURRENCY`) e `POST /messages` com mídia (`MEDIA_UPLOAD_CONCURRENCY`). Fila crescendo = mais mídia chegando do que a bridge processa. |
-| `histórico` | Mensagens que o WhatsApp mandou na sincronização inicial, por leitura. Logo depois de parear um número novo costuma ser o maior pico. Cada pacote também sai em `[<número>] histórico recebido: ...`. |
+| `webhooks-mídia` / `envios-mídia` / `base64-mídia` | Vagas de mídia ocupadas + fila: webhooks montando/enviando mídia (`WEBHOOK_MEDIA_CONCURRENCY`), `POST /messages` com mídia (`MEDIA_UPLOAD_CONCURRENCY`) e `getBase64FromMediaMessage` (`MEDIA_BASE64_CONCURRENCY`). Fila crescendo = mais mídia chegando do que a bridge processa. |
+| `histórico` | Mensagens que o WhatsApp mandou na sincronização inicial, por leitura. Com `HISTORY_SYNC=minimal` só chegam os pacotes iniciais pequenos; números altos aqui com `recent` explicam pico logo depois de parear. Cada pacote também sai em `[<número>] histórico recebido: ...`. |
 | `recebidas` | Mensagens novas (`messages.upsert`) desde a leitura anterior. |
 | `eventLoopP99` | Atraso do event loop: GC pesado ou trabalho síncrono grande. |
 
@@ -1039,7 +1043,16 @@ mensagens e chaves da sessão**: não o compartilhe. Não deixe ligado em produ�
 - **`unhandledRejection`/`uncaughtException` são logados, não derrubam o
   processo**: preferimos manter as outras sessões de pé.
 - **Sem `mediaUrl` no envio** (evita SSRF) e **sem histórico antigo**
-  (`syncFullHistory: false`).
+  (`syncFullHistory: false` e `HISTORY_SYNC=minimal`).
+- **Histórico de mensagens desligado, mapeamentos LID mantidos**: com o
+  default do Baileys, logo depois de parear ele baixa o histórico recente e o
+  acumula inteiro no buffer de eventos até terminar (um objeto indexado pelo id
+  de cada mensagem), o que estourava o heap. `HISTORY_SYNC=minimal` recusa
+  `RECENT`, `FULL`, `ON_DEMAND` e o histórico de status, e aceita só
+  `INITIAL_BOOTSTRAP`, `PUSH_NAME` e `NON_BLOCKING_DATA`, que trazem os
+  mapeamentos LID→número iniciais. Desligar tudo (`off`) faz o Baileys avisar
+  de instabilidade; os mapeamentos ainda são aprendidos de cada mensagem
+  recebida e de cada envio. `recent` volta ao comportamento antigo.
 
 **Limitações conhecidas**
 

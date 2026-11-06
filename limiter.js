@@ -79,6 +79,42 @@ export function createConcurrencyLimiter({ max }) {
 }
 
 /**
+ * Ocupa uma vaga do limiter que dura até a resposta HTTP terminar (ou o
+ * cliente desistir). Sem vaga dentro de timeoutMs, responde 503 com
+ * Retry-After. Retorna true com a vaga ocupada; false quando a resposta já foi
+ * tratada (503) ou o cliente foi embora enquanto esperava.
+ */
+export async function holdSlotForResponse({ limiter, res, timeoutMs, retryAfterSeconds = 5, label = 'envios com mídia' }) {
+  // Cliente que desiste enquanto espera sai da fila (res 'close' sem resposta).
+  const gone = new AbortController()
+  const onClose = () => gone.abort()
+  res.once('close', onClose)
+
+  let release
+  try {
+    release = await limiter.acquire({ timeoutMs, signal: gone.signal })
+  } catch (err) {
+    res.off('close', onClose)
+    if (gone.signal.aborted) return false
+    if (!(err instanceof LimiterTimeoutError)) throw err
+    const { max } = limiter.stats()
+    res.set('Retry-After', String(retryAfterSeconds))
+    res.status(503).json({
+      error: `muitos ${label} em andamento (máximo ${max} ao mesmo tempo); tente de novo em ${retryAfterSeconds}s`
+    })
+    return false
+  }
+  res.off('close', onClose)
+  // O cliente pode ter ido embora no mesmo tick em que a vaga abriu.
+  if (gone.signal.aborted) {
+    release()
+    return false
+  }
+  res.once('close', release)
+  return true
+}
+
+/**
  * Middleware das rotas que recebem mídia em base64. Ocupa uma vaga ANTES de o
  * corpo ser lido (é a leitura e o parse que alocam a memória) e devolve a vaga
  * quando a resposta termina ou o cliente desiste. Corpo pequeno (texto, até
@@ -89,29 +125,10 @@ export function createUploadGate({ limiter, timeoutMs, smallBodyBytes, retryAfte
   return async function uploadGate(req, res, next) {
     const length = Number(req.get('content-length'))
     if (Number.isFinite(length) && length <= smallBodyBytes) return next()
-
-    // Cliente que desiste enquanto espera sai da fila (res 'close' sem resposta).
-    const gone = new AbortController()
-    const onClose = () => gone.abort()
-    res.once('close', onClose)
-
-    let release
     try {
-      release = await limiter.acquire({ timeoutMs, signal: gone.signal })
+      if (await holdSlotForResponse({ limiter, res, timeoutMs, retryAfterSeconds })) next()
     } catch (err) {
-      res.off('close', onClose)
-      if (gone.signal.aborted) return
-      if (!(err instanceof LimiterTimeoutError)) return next(err)
-      const { max } = limiter.stats()
-      res.set('Retry-After', String(retryAfterSeconds))
-      return res.status(503).json({
-        error: `muitos envios com mídia em andamento (máximo ${max} ao mesmo tempo); tente de novo em ${retryAfterSeconds}s`
-      })
+      next(err)
     }
-    res.off('close', onClose)
-    // O cliente pode ter ido embora no mesmo tick em que a vaga abriu.
-    if (gone.signal.aborted) return release()
-    res.once('close', release)
-    next()
   }
 }

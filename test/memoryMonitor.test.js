@@ -241,3 +241,10 @@ test('readContainerMemoryLimit: cgroup v2, v1, "max" e sem cgroup', () => {
   )
   assert.equal(readContainerMemoryLimit({ readFile: files({}), totalMemory: total }), null)
 })
+
+test('pedidos de base64 pela API aparecem na linha e como suspeito', () => {
+  const { monitor, lines } = harness({ used: 900, app: { base64: { active: 3, waiting: 4, max: 3 } } })
+  monitor.report()
+  assert.match(lines.warn[0], /base64-mídia=3\+4/)
+  assert.match(lines.warn.join('\n'), /pedidos de mídia em base64 pela API: 3 em andamento, 4 na fila/)
+})
