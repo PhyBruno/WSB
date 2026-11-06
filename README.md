@@ -961,6 +961,16 @@ cai com frequência, suba temporariamente para `info` ou `debug`. Os dumps de
 sessão de sinal que o libsignal imprime (`Closing session: SessionEntry {...}`,
 com chaves privadas) são descartados.
 
+Status (`status@broadcast`) é descartado pelo Baileys antes de decifrar
+(`shouldIgnoreJid`): a bridge não repassa nem envia status. Antes disso, cada
+status de um contato cuja chave o aparelho não tinha (comum logo depois de
+parear) gerava duas linhas de nível 50, `transaction failed, rolling back` e
+`failed to decrypt message ... No session found to decrypt message` com
+`messageType=skmsg sender=status@broadcast`, mais um pedido de reenvio ao
+celular do autor. Era inofensivo, mas trabalho e ruído à toa. Se essas linhas
+aparecerem para um `remoteJid` que **não** é `status@broadcast` (conversa ou
+grupo), aí sim é mensagem real que não foi decifrada.
+
 ### Diagnóstico de memória
 
 Um estouro de heap do V8 (`FatalProcessOutOfMemory`, seguido de uma pilha de
@@ -1044,6 +1054,8 @@ mensagens e chaves da sessão**: não o compartilhe. Não deixe ligado em produ�
   processo**: preferimos manter as outras sessões de pé.
 - **Sem `mediaUrl` no envio** (evita SSRF) e **sem histórico antigo**
   (`syncFullHistory: false` e `HISTORY_SYNC=minimal`).
+- **Status ignorado na origem** (`shouldIgnoreJid`): o Baileys responde ao
+  servidor e descarta `status@broadcast` sem decifrar nem pedir reenvio.
 - **Histórico de mensagens desligado, mapeamentos LID mantidos**: com o
   default do Baileys, logo depois de parear ele baixa o histórico recente e o
   acumula inteiro no buffer de eventos até terminar (um objeto indexado pelo id

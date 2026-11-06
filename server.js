@@ -20,6 +20,7 @@ import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
 import { makePnResolver, normalizeKeyAddressing, normalizeContextInfoAddressing } from './lid.js'
 import {
+  shouldIgnoreJid,
   shouldProcess,
   prepareMessage,
   classifyOrigin,
@@ -734,6 +735,8 @@ async function startSession(id) {
     // histórico recente (RECENT) continuava vindo e era o que estourava o
     // heap: ver historySync.js e HISTORY_SYNC.
     shouldSyncHistoryMessage,
+    // Status (status@broadcast) é descartado antes do decrypt: ver inbound.js.
+    shouldIgnoreJid,
     // getMessage: a documentação do baileys trata isso como praticamente
     // obrigatório — é o que permite reenviar uma mensagem quando o WhatsApp
     // pede retry (evita mensagens travadas em "this message can take a

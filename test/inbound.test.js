@@ -10,7 +10,8 @@ import {
   classifyOrigin,
   parseProtocol,
   isMediaMessage,
-  createApiMessageRegistry
+  createApiMessageRegistry,
+  shouldIgnoreJid
 } from '../inbound.js'
 
 // Fixtures sintéticos (Buffers no formato BufferJSON do Baileys).
@@ -272,4 +273,18 @@ test('createApiMessageRegistry descarta o mais antigo acima de max', () => {
   assert.equal(registry.has('A'), false)
   assert.equal(registry.has('B'), true)
   assert.equal(registry.has('C'), true)
+})
+
+test('shouldIgnoreJid descarta só status (antes do decrypt); conversa, grupo, LID e newsletter seguem', () => {
+  assert.equal(shouldIgnoreJid('status@broadcast'), true)
+  for (const jid of [
+    '5511999999999@s.whatsapp.net',
+    '120363000000000001@g.us',
+    '25525091348716@lid',
+    '120363000000000002@newsletter',
+    's.whatsapp.net',
+    undefined
+  ]) {
+    assert.equal(shouldIgnoreJid(jid), false, String(jid))
+  }
 })
