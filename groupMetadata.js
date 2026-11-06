@@ -310,6 +310,22 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
 
     resolveSubjects,
 
+    /** Retrato pro diagnóstico de memória (memoryMonitor.js). */
+    stats() {
+      let groups = 0
+      let withMetadata = 0
+      let participants = 0
+      for (const map of memory.values()) {
+        groups += map.size
+        for (const entry of map.values()) {
+          if (!entry.metadata) continue
+          withMetadata++
+          participants += entry.metadata.participants?.length ?? 0
+        }
+      }
+      return { groups, withMetadata, participants, failures: failures.size, flights: flights.size }
+    },
+
     /** Nome de um grupo (string | null). Nunca lança. */
     async getSubject(sessionId, jid) {
       return (await resolveSubjects(sessionId, [jid])).get(jid) ?? null

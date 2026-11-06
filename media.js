@@ -197,6 +197,9 @@ export function createMediaCache({ ttlMs = 60_000, maxBytes = 104_857_600, now =
     },
     get totalBytes() {
       return totalBytes
+    },
+    get size() {
+      return entries.size
     }
   }
 }
@@ -294,6 +297,11 @@ export function createMediaDownloader({ maxBytes, timeoutMs, cacheMaxBytes, maxC
       return cache.getOrLoad(`${sessionId}:${data.key.id}`, () =>
         limited(() => downloadMedia(sock, data, { maxBytes, timeoutMs }))
       )
+    },
+
+    /** Retrato pro diagnóstico de memória (memoryMonitor.js). */
+    stats() {
+      return { cacheBytes: cache.totalBytes, cacheEntries: cache.size, active, waiting: waiting.length }
     }
   }
 }

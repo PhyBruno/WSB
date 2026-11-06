@@ -55,6 +55,7 @@ import {
   silenceSignalSessionDumps
 } from './connectionEvents.js'
 import { createSessionLogout } from './sessionLogout.js'
+import { createMemoryMonitor } from './memoryMonitor.js'
 
 // Antes de qualquer sessão abrir: o libsignal despeja chaves privadas no
 // stdout a cada sessão de sinal (ver connectionEvents.js).
@@ -208,6 +209,18 @@ const GROUP_METADATA_CONFIG = {
 const GROUP_HISTORY_LIMITS = {
   maxLookups: numberFromEnv('GROUP_METADATA_HISTORY_MAX_LOOKUPS', 10, { min: 0, integer: true }),
   budgetMs: numberFromEnv('GROUP_METADATA_HISTORY_BUDGET_MS', 5_000, { min: 0 })
+}
+
+// Diagnóstico de memória (memoryMonitor.js): uma linha por MEMORY_LOG_INTERVAL_MS
+// com o uso do processo e o que a aplicação está segurando; acima de
+// MEMORY_WARN_RATIO do limite do heap vira ALERTA com os suspeitos e passa a
+// sair a cada MEMORY_ALERT_INTERVAL_MS. 0 em MEMORY_LOG_INTERVAL_MS desativa.
+const MEMORY_LOG_INTERVAL_MS = numberFromEnv('MEMORY_LOG_INTERVAL_MS', 60_000, { min: 0 })
+const MEMORY_ALERT_INTERVAL_MS = numberFromEnv('MEMORY_ALERT_INTERVAL_MS', 10_000, { min: 1_000 })
+const MEMORY_WARN_RATIO = numberFromEnv('MEMORY_WARN_RATIO', 0.7, { min: 0.1 })
+if (MEMORY_WARN_RATIO > 1) {
+  console.error('ERRO: MEMORY_WARN_RATIO precisa estar entre 0.1 e 1 (fração do limite do heap).')
+  process.exit(1)
 }
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
@@ -488,6 +501,27 @@ const dispatcher = createDispatcher({
 })
 const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
 
+const memoryMonitor = createMemoryMonitor({
+  intervalMs: MEMORY_LOG_INTERVAL_MS,
+  alertIntervalMs: MEMORY_ALERT_INTERVAL_MS,
+  warnRatio: MEMORY_WARN_RATIO,
+  getAppStats: () => {
+    const byStatus = {}
+    let sentMessages = 0
+    for (const entry of sessions.values()) {
+      byStatus[entry.status] = (byStatus[entry.status] ?? 0) + 1
+      sentMessages += entry.sentMessages?.size ?? 0
+    }
+    return {
+      sessions: byStatus,
+      sentMessages,
+      media: media.stats(),
+      groups: groups.stats(),
+      dispatcher: dispatcher.stats()
+    }
+  }
+})
+
 // Evento de mensagem nova, chamado dentro da transação que inseriu a linha
 // (onInserted). Enviada pela API vira SEND_MESSAGE e nunca MESSAGES_UPSERT
 // (selectTargets também barra isso); como só quem insere chama este gancho,
@@ -705,6 +739,7 @@ async function startSession(id) {
   // try/catch: uma mensagem malformada ou um erro de banco não pode
   // interromper as outras do lote nem derrubar o socket.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    memoryMonitor.count(id, 'upsert', { messages: messages.length })
     for (const received of messages) {
       try {
         await processIncomingMessage(id, entry, sock, received, type)
@@ -712,6 +747,18 @@ async function startSession(id) {
         console.error(`[${id}] falha ao processar mensagem recebida ${received?.key?.id ?? '?'}: ${err.message}`)
       }
     }
+  })
+
+  // Só mede e loga (a bridge não guarda o histórico): a sincronização que o
+  // WhatsApp manda logo depois de parear é a maior pressão de memória do
+  // Baileys, e saber quanto chegou, e quando, explica um estouro de heap.
+  sock.ev.on('messaging-history.set', ({ messages, chats, contacts, syncType, progress }) => {
+    const amounts = { messages: messages?.length ?? 0, chats: chats?.length ?? 0, contacts: contacts?.length ?? 0 }
+    memoryMonitor.count(id, 'history', amounts)
+    console.log(
+      `[${id}] histórico recebido: mensagens=${amounts.messages} conversas=${amounts.chats} ` +
+        `contatos=${amounts.contacts} syncType=${syncType ?? 'n/a'} progresso=${progress ?? 'n/a'}`
+    )
   })
 
   // Nome dos grupos: entrou num grupo (upsert), renomeado ou sincronização
@@ -1325,6 +1372,7 @@ async function main() {
   // Depois do migrate (as tabelas do outbox precisam existir) e antes das
   // sessões: entregas que sobraram de antes do restart já voltam a sair.
   dispatcher.start()
+  memoryMonitor.start()
   if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()
   startConnectionEventsRetention()
   // Bounded pelo timeout interno de resolveBaileysVersion — nunca trava o

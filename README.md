@@ -286,6 +286,10 @@ sobe sem ela); todo o resto tem default.
 | `MESSAGE_STATUS_TIMEOUT_MS` | `8000` | Quanto `/messages` espera pela confirmação real de entrega (`0` desativa). |
 | `BAILEYS_LOG_LEVEL` | `warn` | Logs internos do Baileys (pino JSON): `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`. |
 | `CONNECTION_EVENTS_RETENTION_DAYS` | `30` | Dias de histórico em `wa_connection_events`. |
+| `NODE_MAX_OLD_SPACE_MB` | `1536` | Só do compose: vira `--max-old-space-size` (teto do heap do Node). Use ~75% do limite do container. |
+| `MEMORY_LOG_INTERVAL_MS` | `60000` | Intervalo da linha `memória: ...` no log (`0` desativa). |
+| `MEMORY_WARN_RATIO` | `0.7` | Fração do limite do heap a partir da qual a linha vira ALERTA com os suspeitos. |
+| `MEMORY_ALERT_INTERVAL_MS` | `10000` | Intervalo das leituras enquanto em ALERTA (mínimo `1000`). |
 
 `RECONNECT_MAX_ATTEMPTS` e `RECONNECT_DELAY_MS` são validados no boot: valor
 inválido faz o servidor recusar subir (em vez de desativar o limite sem aviso).
@@ -946,6 +950,57 @@ nível `BAILEYS_LOG_LEVEL` (default `warn`). Para investigar uma instância que
 cai com frequência, suba temporariamente para `info` ou `debug`. Os dumps de
 sessão de sinal que o libsignal imprime (`Closing session: SessionEntry {...}`,
 com chaves privadas) são descartados.
+
+### Diagnóstico de memória
+
+Um estouro de heap do V8 (`FatalProcessOutOfMemory`, seguido de uma pilha de
+`v8::internal::...`) derruba o processo sem passar por nenhum handler de JS e
+não deixa o motivo no log. Por isso a bridge registra, antes, o que está
+segurando memória. Na subida:
+
+```
+memória: monitor ativo — limite do heap do V8 = 1536MB, leitura a cada 60s (a cada 10s acima de 70%)
+```
+
+E, a cada `MEMORY_LOG_INTERVAL_MS`:
+
+```
+memória: rss=812MB heap=640/1536MB (42%) Δheap=+120MB old=500MB grandes=90MB novos=30MB fora-do-heap=40MB buffers=30MB eventLoopP99=12ms sessões={connected=2,qr=1} enviadas-em-cache=200 mídia={cache=12MB/3,downloads=1+0} grupos={cache=450,metadata=80,participantes=9000} webhooks-em-voo=2 recebidas=30 histórico={mensagens=12000,conversas=300,contatos=800}
+```
+
+Como ler:
+
+| Campo | O que indica |
+|---|---|
+| `heap=usado/limite` | Quanto do teto do V8 já foi usado. Inclui lixo ainda não coletado: um pico que volta é normal, **subir sem voltar** não é. |
+| `Δheap` | Variação desde a leitura anterior. Salto grande de uma linha pra outra mostra *quando* começou. |
+| `grandes` | Objetos enormes (strings/arrays). Alto = mídia em base64 ou JSON de webhook com mídia. |
+| `fora-do-heap` / `buffers` | Memória que o heap não vê: mídia baixada, criptografia. |
+| `mídia`, `grupos`, `enviadas-em-cache` | O que os caches da própria bridge seguram. |
+| `histórico` | Mensagens que o WhatsApp mandou na sincronização inicial, por leitura. Logo depois de parear um número novo costuma ser o maior pico. Cada pacote também sai em `[<número>] histórico recebido: ...`. |
+| `recebidas` | Mensagens novas (`messages.upsert`) desde a leitura anterior. |
+| `eventLoopP99` | Atraso do event loop: GC pesado ou trabalho síncrono grande. |
+
+Acima de `MEMORY_WARN_RATIO` do limite, a linha vira `memória: ALERTA ...`, as
+leituras passam a sair a cada `MEMORY_ALERT_INTERVAL_MS` e vêm linhas
+`memória: suspeito: ...` apontando onde olhar (mídia, histórico, grupos, muitas
+sessões). Se nenhum contador da bridge explicar o uso, o suspeito é retenção
+dentro do Baileys ou do driver do Postgres.
+
+Quando o processo morrer, as **últimas linhas `memória:` antes do crash** são a
+evidência: veja qual campo crescia e o que `Δheap` mostrava.
+
+Para uma prova definitiva (o que, objeto por objeto, ocupa o heap), suba uma
+vez com um heap snapshot automático perto do limite:
+
+```
+NODE_OPTIONS=--max-old-space-size=1536 --heapsnapshot-near-heap-limit=1 --diagnostic-dir=/tmp
+```
+
+O arquivo `.heapsnapshot` cai em `/tmp` do container (some no restart: copie com
+`docker cp` antes) e abre no Chrome DevTools, aba *Memory*. Atenção: gerar o
+snapshot precisa de memória extra (do tamanho do heap) e o arquivo **contém
+mensagens e chaves da sessão**: não o compartilhe. Não deixe ligado em produção.
 
 ---
 

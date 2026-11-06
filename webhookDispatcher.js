@@ -477,6 +477,11 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
       await Promise.allSettled([...inFlight])
     },
 
+    /** Retrato pro diagnóstico de memória (memoryMonitor.js). */
+    stats() {
+      return { inFlight: inFlight.size }
+    },
+
     /** Chamado depois do COMMIT de um enqueue: entrega sem esperar o polling. */
     wake() {
       if (running) pump()

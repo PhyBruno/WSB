@@ -79,6 +79,11 @@ services:
       - GROUP_METADATA_TIMEOUT_MS=${GROUP_METADATA_TIMEOUT_MS:-3000}
       - GROUP_METADATA_HISTORY_MAX_LOOKUPS=${GROUP_METADATA_HISTORY_MAX_LOOKUPS:-10}
       - GROUP_METADATA_HISTORY_BUDGET_MS=${GROUP_METADATA_HISTORY_BUDGET_MS:-5000}
+      ## Memória: teto do heap do Node (deixe ~25% do limite do container pra Buffers) e diagnóstico
+      - NODE_OPTIONS=--max-old-space-size=${NODE_MAX_OLD_SPACE_MB:-1536}
+      - MEMORY_LOG_INTERVAL_MS=${MEMORY_LOG_INTERVAL_MS:-60000}
+      - MEMORY_ALERT_INTERVAL_MS=${MEMORY_ALERT_INTERVAL_MS:-10000}
+      - MEMORY_WARN_RATIO=${MEMORY_WARN_RATIO:-0.7}
     deploy:
       mode: replicated
       replicas: 1
@@ -95,7 +100,7 @@ services:
           memory: 128M
         limits:
           cpus: "0.5"
-          memory: 512M
+          memory: 2048M
       labels:
         - traefik.enable=1
         - traefik.http.routers.whatsapp_bridge_api.rule=Host(`yoururl.com.br`) ## Url da aplicação
