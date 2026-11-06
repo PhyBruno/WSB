@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { isJidGroup } from 'baileys'
 import { isMediaMessage } from './inbound.js'
 import { MAX_CONCURRENT_DOWNLOADS } from './media.js'
+import { createConcurrencyLimiter } from './limiter.js'
 import { HeaderDecryptError } from './secrets.js'
 
 // Worker do outbox de webhooks (wa_webhook_deliveries), in-process. As
@@ -230,13 +231,23 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
   let pollTimer = null
   let cleanupTimer = null
 
-  // Lease de uma entrega em "delivering": cobre a espera na fila de downloads
-  // de mídia (limitada em MAX_CONCURRENT_DOWNLOADS), o download, o POST e
-  // uma folga. Se o processo morrer no meio, a linha volta a ser elegível
-  // quando o lease vencer (em vez de ficar presa pra sempre).
+  // Entregas com mídia montando/enviando ao mesmo tempo. O limite de
+  // downloads (media.js) não basta: depois do download, o base64, o JSON e o
+  // corpo do POST (~5x o arquivo) ficavam vivos em todas as entregas do
+  // dispatcher ao mesmo tempo — 10 webhooks com mídia de 20MB passavam de
+  // 1,5GB no teste de estresse. A vaga vai do download até o fim do POST.
+  const mediaConcurrency = config.mediaConcurrency ?? MAX_CONCURRENT_DOWNLOADS
+  const mediaSlots = createConcurrencyLimiter({ max: mediaConcurrency })
+
+  // Lease de uma entrega em "delivering": cobre a espera por uma vaga de
+  // mídia (cada entrega à frente segura a vaga por até um download + um
+  // POST), o próprio download, o POST e uma folga. Se o processo morrer no
+  // meio, a linha volta a ser elegível quando o lease vencer (em vez de ficar
+  // presa pra sempre).
   const leaseMs =
     config.timeoutMs +
-    config.mediaTimeoutMs * Math.ceil(config.concurrency / MAX_CONCURRENT_DOWNLOADS) +
+    config.mediaTimeoutMs +
+    (config.mediaTimeoutMs + config.timeoutMs) * Math.ceil(config.concurrency / mediaConcurrency) +
     (groups?.timeoutMs ?? 0) +
     30_000
 
@@ -377,20 +388,27 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
       groups && GROUP_SUBJECT_EVENTS.has(row.event) && isJidGroup(data?.key?.remoteJid)
         ? groups.getSubject(row.session_id, data.key.remoteJid)
         : undefined
-    if (row.base64 && media && isMediaMessage(data?.messageType)) data = await withMedia(row.session_id, data)
-    if (groupSubject !== undefined) data = { ...data, groupSubject: (await groupSubject) ?? null }
+    const withFile = Boolean(row.base64 && media && isMediaMessage(data?.messageType))
+    const release = withFile ? await mediaSlots.acquire() : null
+    let result
+    try {
+      if (withFile) data = await withMedia(row.session_id, data)
+      if (groupSubject !== undefined) data = { ...data, groupSubject: (await groupSubject) ?? null }
 
-    const { url, body } = buildEnvelope({
-      event: row.event,
-      instance: row.session_id,
-      data,
-      url: row.url,
-      byEvents: row.by_events,
-      sender: row.session_jid,
-      serverUrl: config.serverUrl
-    })
-    const headers = buildHeaders({ instance: row.session_id, event: row.event, deliveryId: row.id, headers: customHeaders })
-    const result = await postJson(url, headers, body, config.timeoutMs)
+      const { url, body } = buildEnvelope({
+        event: row.event,
+        instance: row.session_id,
+        data,
+        url: row.url,
+        byEvents: row.by_events,
+        sender: row.session_jid,
+        serverUrl: config.serverUrl
+      })
+      const headers = buildHeaders({ instance: row.session_id, event: row.event, deliveryId: row.id, headers: customHeaders })
+      result = await postJson(url, headers, body, config.timeoutMs)
+    } finally {
+      release?.()
+    }
     await finish(row, result)
   }
 
@@ -475,6 +493,11 @@ export function createDispatcher({ pool, cipher, getSocket = () => undefined, co
       clearInterval(pollTimer)
       clearInterval(cleanupTimer)
       await Promise.allSettled([...inFlight])
+    },
+
+    /** Retrato pro diagnóstico de memória (memoryMonitor.js). */
+    stats() {
+      return { inFlight: inFlight.size, media: mediaSlots.stats() }
     },
 
     /** Chamado depois do COMMIT de um enqueue: entrega sem esperar o polling. */

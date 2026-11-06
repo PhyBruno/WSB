@@ -20,6 +20,7 @@ import { pool, migrate } from './db.js'
 import { usePostgresAuthState, wipeAuthState } from './postgresAuthState.js'
 import { makePnResolver, normalizeKeyAddressing, normalizeContextInfoAddressing } from './lid.js'
 import {
+  shouldIgnoreJid,
   shouldProcess,
   prepareMessage,
   classifyOrigin,
@@ -55,6 +56,9 @@ import {
   silenceSignalSessionDumps
 } from './connectionEvents.js'
 import { createSessionLogout } from './sessionLogout.js'
+import { createMemoryMonitor } from './memoryMonitor.js'
+import { createConcurrencyLimiter, createUploadGate } from './limiter.js'
+import { HISTORY_SYNC_MODES, historySyncFilter, historySyncTypeName } from './historySync.js'
 
 // Antes de qualquer sessão abrir: o libsignal despeja chaves privadas no
 // stdout a cada sessão de sinal (ver connectionEvents.js).
@@ -168,6 +172,10 @@ const WEBHOOK_CONFIG = {
   mediaMaxBytes: numberFromEnv('WEBHOOK_MEDIA_MAX_BYTES', 20_971_520, { min: 0 }),
   mediaTimeoutMs: numberFromEnv('WEBHOOK_MEDIA_TIMEOUT_MS', 30_000, { min: 1 }),
   mediaCacheMaxBytes: numberFromEnv('WEBHOOK_MEDIA_CACHE_MAX_BYTES', 104_857_600, { min: 0 }),
+  // Entregas com mídia montando/enviando ao mesmo tempo (download + base64 +
+  // JSON + POST, ~5x o arquivo cada). As demais esperam a vez; entregas sem
+  // mídia não entram nessa fila.
+  mediaConcurrency: numberFromEnv('WEBHOOK_MEDIA_CONCURRENCY', 3, { min: 1, integer: true }),
   retentionDays: numberFromEnv('WEBHOOK_DELIVERY_RETENTION_DAYS', 7, { min: 1 })
 }
 
@@ -209,6 +217,42 @@ const GROUP_HISTORY_LIMITS = {
   maxLookups: numberFromEnv('GROUP_METADATA_HISTORY_MAX_LOOKUPS', 10, { min: 0, integer: true }),
   budgetMs: numberFromEnv('GROUP_METADATA_HISTORY_BUDGET_MS', 5_000, { min: 0 })
 }
+
+// Diagnóstico de memória (memoryMonitor.js): uma linha por MEMORY_LOG_INTERVAL_MS
+// com o uso do processo e o que a aplicação está segurando; acima de
+// MEMORY_WARN_RATIO do limite do heap vira ALERTA com os suspeitos e passa a
+// sair a cada MEMORY_ALERT_INTERVAL_MS. 0 em MEMORY_LOG_INTERVAL_MS desativa.
+const MEMORY_LOG_INTERVAL_MS = numberFromEnv('MEMORY_LOG_INTERVAL_MS', 60_000, { min: 0 })
+const MEMORY_ALERT_INTERVAL_MS = numberFromEnv('MEMORY_ALERT_INTERVAL_MS', 10_000, { min: 1_000 })
+const MEMORY_WARN_RATIO = numberFromEnv('MEMORY_WARN_RATIO', 0.7, { min: 0.1 })
+if (MEMORY_WARN_RATIO > 1) {
+  console.error('ERRO: MEMORY_WARN_RATIO precisa estar entre 0.1 e 1 (fração do limite do heap).')
+  process.exit(1)
+}
+
+// POST /messages e /message/sendButtons com corpo grande (mídia em base64)
+// processados ao mesmo tempo. Cada um custa ~2,5x o tamanho do corpo enquanto
+// é lido, parseado e decodificado: sem teto, 40 envios de 14MB simultâneos
+// levavam o processo a 1,5GB no teste de estresse. Quem passar do limite
+// espera até MEDIA_UPLOAD_QUEUE_TIMEOUT_MS na fila, sem o corpo ser lido; depois
+// disso recebe 503 com Retry-After. Envio de texto (corpo pequeno) não entra.
+const MEDIA_UPLOAD_CONCURRENCY = numberFromEnv('MEDIA_UPLOAD_CONCURRENCY', 5, { min: 1, integer: true })
+const MEDIA_UPLOAD_QUEUE_TIMEOUT_MS = numberFromEnv('MEDIA_UPLOAD_QUEUE_TIMEOUT_MS', 30_000, { min: 0 })
+// POST /chat/getBase64FromMediaMessage montando a resposta ao mesmo tempo
+// (download + base64 + JSON, ~4x o arquivo cada). Mesma fila e o mesmo 503
+// dos envios, com o mesmo MEDIA_UPLOAD_QUEUE_TIMEOUT_MS.
+const MEDIA_BASE64_CONCURRENCY = numberFromEnv('MEDIA_BASE64_CONCURRENCY', 3, { min: 1, integer: true })
+
+// Quais pacotes da sincronização de histórico o Baileys baixa (historySync.js).
+// minimal (default) descarta o histórico de mensagens — a bridge não o usa e
+// era ele que estourava o heap logo depois de parear —, mas mantém os pacotes
+// pequenos com os mapeamentos LID→número e os nomes de contato.
+const HISTORY_SYNC = (process.env.HISTORY_SYNC || 'minimal').trim().toLowerCase()
+if (!HISTORY_SYNC_MODES[HISTORY_SYNC]) {
+  console.error(`ERRO: HISTORY_SYNC precisa ser um de: ${Object.keys(HISTORY_SYNC_MODES).join(', ')}.`)
+  process.exit(1)
+}
+const shouldSyncHistoryMessage = historySyncFilter(HISTORY_SYNC)
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
 // SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
@@ -488,6 +532,32 @@ const dispatcher = createDispatcher({
 })
 const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
 
+const uploadSlots = createConcurrencyLimiter({ max: MEDIA_UPLOAD_CONCURRENCY })
+const base64Slots = createConcurrencyLimiter({ max: MEDIA_BASE64_CONCURRENCY })
+
+const memoryMonitor = createMemoryMonitor({
+  intervalMs: MEMORY_LOG_INTERVAL_MS,
+  alertIntervalMs: MEMORY_ALERT_INTERVAL_MS,
+  warnRatio: MEMORY_WARN_RATIO,
+  getAppStats: () => {
+    const byStatus = {}
+    let sentMessages = 0
+    for (const entry of sessions.values()) {
+      byStatus[entry.status] = (byStatus[entry.status] ?? 0) + 1
+      sentMessages += entry.sentMessages?.size ?? 0
+    }
+    return {
+      sessions: byStatus,
+      sentMessages,
+      media: media.stats(),
+      groups: groups.stats(),
+      dispatcher: dispatcher.stats(),
+      uploads: uploadSlots.stats(),
+      base64: base64Slots.stats()
+    }
+  }
+})
+
 // Evento de mensagem nova, chamado dentro da transação que inseriu a linha
 // (onInserted). Enviada pela API vira SEND_MESSAGE e nunca MESSAGES_UPSERT
 // (selectTargets também barra isso); como só quem insere chama este gancho,
@@ -661,6 +731,12 @@ async function startSession(id) {
     // completo a cada pareamento novo, o que custa tempo e banda à toa e
     // dispararia avisos de webhook de mensagens velhas.
     syncFullHistory: false,
+    // syncFullHistory só controla o pedido de histórico COMPLETO (FULL). O
+    // histórico recente (RECENT) continuava vindo e era o que estourava o
+    // heap: ver historySync.js e HISTORY_SYNC.
+    shouldSyncHistoryMessage,
+    // Status (status@broadcast) é descartado antes do decrypt: ver inbound.js.
+    shouldIgnoreJid,
     // getMessage: a documentação do baileys trata isso como praticamente
     // obrigatório — é o que permite reenviar uma mensagem quando o WhatsApp
     // pede retry (evita mensagens travadas em "this message can take a
@@ -705,6 +781,7 @@ async function startSession(id) {
   // try/catch: uma mensagem malformada ou um erro de banco não pode
   // interromper as outras do lote nem derrubar o socket.
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    memoryMonitor.count(id, 'upsert', { messages: messages.length })
     for (const received of messages) {
       try {
         await processIncomingMessage(id, entry, sock, received, type)
@@ -712,6 +789,19 @@ async function startSession(id) {
         console.error(`[${id}] falha ao processar mensagem recebida ${received?.key?.id ?? '?'}: ${err.message}`)
       }
     }
+  })
+
+  // Só mede e loga (a bridge não guarda o histórico): a sincronização que o
+  // WhatsApp manda logo depois de parear é a maior pressão de memória do
+  // Baileys, e saber quanto chegou, e quando, explica um estouro de heap.
+  sock.ev.on('messaging-history.set', ({ messages, chats, contacts, syncType, progress }) => {
+    const amounts = { messages: messages?.length ?? 0, chats: chats?.length ?? 0, contacts: contacts?.length ?? 0 }
+    memoryMonitor.count(id, 'history', amounts)
+    console.log(
+      `[${id}] histórico recebido: mensagens=${amounts.messages} conversas=${amounts.chats} ` +
+        `contatos=${amounts.contacts} syncType=${syncType == null ? 'n/a' : historySyncTypeName(syncType)} ` +
+        `progresso=${progress ?? 'n/a'}`
+    )
   })
 
   // Nome dos grupos: entrou num grupo (upsert), renomeado ou sincronização
@@ -975,15 +1065,35 @@ app.use('/sessions', (req, res, next) => {
 const MEDIA_UPLOAD_ROUTE = /^\/[^/]+\/(messages|message\/sendButtons)\/?$/
 const largeJson = express.json({ limit: JSON_BODY_LIMIT })
 const smallJson = express.json({ limit: SMALL_JSON_LIMIT })
-app.use('/sessions', (req, res, next) =>
-  (req.method === 'POST' && MEDIA_UPLOAD_ROUTE.test(req.path) ? largeJson : smallJson)(req, res, next)
-)
+// Vaga de envio com mídia (MEDIA_UPLOAD_CONCURRENCY) ocupada antes de ler o
+// corpo: é a leitura que aloca. Corpo até o limite das rotas comuns não ocupa.
+const uploadGate = createUploadGate({
+  limiter: uploadSlots,
+  timeoutMs: MEDIA_UPLOAD_QUEUE_TIMEOUT_MS,
+  smallBodyBytes: 256 * 1024
+})
+app.use('/sessions', (req, res, next) => {
+  if (req.method === 'POST' && MEDIA_UPLOAD_ROUTE.test(req.path)) {
+    return uploadGate(req, res, (err) => (err ? next(err) : largeJson(req, res, next)))
+  }
+  smallJson(req, res, next)
+})
 
 // Configurações, histórico e webhooks por instância (webhookRoutes.js). Tem
 // que vir depois do middleware acima: herda a exigência de x-api-key.
 app.use(
   '/sessions/:id',
-  webhookRoutes({ sessions, pool, webhooks, dispatcher, media, groups, historyLimits: GROUP_HISTORY_LIMITS })
+  webhookRoutes({
+    sessions,
+    pool,
+    webhooks,
+    dispatcher,
+    media,
+    groups,
+    historyLimits: GROUP_HISTORY_LIMITS,
+    base64Slots,
+    base64QueueTimeoutMs: MEDIA_UPLOAD_QUEUE_TIMEOUT_MS
+  })
 )
 
 // Conecta (ou reconecta) uma sessão. O :id é o número, só dígitos com DDI.
@@ -1325,6 +1435,10 @@ async function main() {
   // Depois do migrate (as tabelas do outbox precisam existir) e antes das
   // sessões: entregas que sobraram de antes do restart já voltam a sair.
   dispatcher.start()
+  memoryMonitor.start()
+  console.log(`histórico do WhatsApp: HISTORY_SYNC=${HISTORY_SYNC} (ver historySync.js)`)
+  // Listas de participantes vencidas (metadataTtlMs) saem da memória.
+  setInterval(() => groups.sweep(), 60_000).unref()
   if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()
   startConnectionEventsRetention()
   // Bounded pelo timeout interno de resolveBaileysVersion — nunca trava o

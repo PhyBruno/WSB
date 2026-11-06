@@ -104,6 +104,7 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
       groups.delete(jid)
       return undefined
     }
+    if (hit.metadata && hit.metadataExpiresAt <= now()) hit.metadata = null
     return hit
   }
 
@@ -309,6 +310,48 @@ export function createGroupMetadataCache({ pool, getSocket = () => undefined, co
     timeoutMs,
 
     resolveSubjects,
+
+    /**
+     * Tira da memória o que venceu: o grupo inteiro depois de ttlMs e a lista
+     * de participantes depois de metadataTtlMs. Sem isso a lista (~290 bytes
+     * por participante) ficava até 6h na memória, embora só sirva 5 min, pois
+     * fromMemory só descarta o que é lido de novo. Chamado periodicamente.
+     */
+    sweep() {
+      const current = now()
+      let groupsRemoved = 0
+      let metadataRemoved = 0
+      for (const [sessionId, groups] of memory) {
+        for (const [jid, entry] of groups) {
+          if (entry.expiresAt <= current) {
+            groups.delete(jid)
+            groupsRemoved++
+          } else if (entry.metadata && entry.metadataExpiresAt <= current) {
+            entry.metadata = null
+            metadataRemoved++
+          }
+        }
+        if (groups.size === 0) memory.delete(sessionId)
+      }
+      for (const [id, until] of failures) if (until <= current) failures.delete(id)
+      return { groupsRemoved, metadataRemoved }
+    },
+
+    /** Retrato pro diagnóstico de memória (memoryMonitor.js). */
+    stats() {
+      let groups = 0
+      let withMetadata = 0
+      let participants = 0
+      for (const map of memory.values()) {
+        groups += map.size
+        for (const entry of map.values()) {
+          if (!entry.metadata) continue
+          withMetadata++
+          participants += entry.metadata.participants?.length ?? 0
+        }
+      }
+      return { groups, withMetadata, participants, failures: failures.size, flights: flights.size }
+    },
 
     /** Nome de um grupo (string | null). Nunca lança. */
     async getSubject(sessionId, jid) {

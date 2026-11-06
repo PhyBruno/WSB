@@ -55,6 +55,20 @@ function protocolTypeName(type) {
 }
 
 /**
+ * shouldIgnoreJid do makeWASocket: o Baileys responde ao servidor e descarta
+ * o nó ANTES de decifrar. Só status (status@broadcast): a bridge não repassa
+ * nem envia status (shouldProcess abaixo e parseSendTarget em outbound.js), e
+ * decifrá-los custava caro à toa — sem a sender key do autor (comum logo
+ * depois de parear) o decrypt falhava com "No session found to decrypt
+ * message", o Baileys logava em nível de erro e pedia ao celular do autor que
+ * reenviasse, só pra a mensagem ser descartada aqui depois. Mesmo padrão da
+ * Evolution (readStatus desligado).
+ */
+export function shouldIgnoreJid(jid) {
+  return Boolean(jid && isJidStatusBroadcast(jid))
+}
+
+/**
  * Decide se uma mensagem do messages.upsert entra no pipeline (grava + webhook).
  * Filtros iguais aos da Evolution, mais o "ignorar grupos" por instância.
  */

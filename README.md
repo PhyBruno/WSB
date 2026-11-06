@@ -99,7 +99,9 @@ diferenças (poucas e intencionais) estão em
 
 - Não tem regra de negócio, fila de campanhas, CRM ou chatbot.
 - Não importa o histórico antigo do aparelho: só o que chega depois que a
-  instância conecta (`syncFullHistory: false`).
+  instância conecta. Nem baixa o histórico recente que o WhatsApp oferece ao
+  parear (`HISTORY_SYNC=minimal`): só os pacotes pequenos com mapeamentos
+  LID→número e nomes de contato.
 - Não converte formatos de mídia (não há ffmpeg na imagem).
 - Não tem fila de envio: cada disparo é síncrono.
 - Não distingue consumidores: a API key é única e global.
@@ -244,6 +246,13 @@ SHA curto do commit). Ajuste a regra `Host(...)` do router, defina
 `whatsapp_bridge_postgres_data` e a rede `network_public`. Atrás de proxy, o IP
 do cliente chega em `x-forwarded-for` / `x-real-ip`.
 
+### Atualizando de versão
+
+O [`CHANGELOG.md`](CHANGELOG.md) traz, para cada versão, o que muda de
+comportamento, as variáveis novas, o passo a passo (imagem, Swarm, Compose),
+como conferir que subiu certo e como voltar atrás. Leia antes de trocar a tag
+da imagem.
+
 ### Sobre a imagem
 
 - Base `node:22-slim` (glibc, não alpine): o Baileys puxa o `sharp` como
@@ -275,6 +284,9 @@ sobe sem ela); todo o resto tem default.
 | `POSTGRES_PASSWORD` | — | Só do `docker-compose`: cria o banco e monta o `DATABASE_URL` da bridge. |
 | `SERVER_URL` | vazio | URL pública da bridge; vai no campo `server_url` dos webhooks (vazio = `null`). |
 | `JSON_BODY_LIMIT` | `20mb` | Limite do body nas rotas de mídia (`/messages`, `/message/sendButtons`); as demais aceitam até 256kb. |
+| `MEDIA_UPLOAD_CONCURRENCY` | `5` | Envios com corpo grande (mídia em base64) processados ao mesmo tempo nessas rotas. Corpo até 256kb (texto) não conta. |
+| `MEDIA_UPLOAD_QUEUE_TIMEOUT_MS` | `30000` | Espera máxima na fila por uma vaga de envio ou de base64; depois disso, `503` com `Retry-After` (no envio, o corpo nem é lido). |
+| `MEDIA_BASE64_CONCURRENCY` | `3` | `POST /chat/getBase64FromMediaMessage` montando a resposta ao mesmo tempo (download, base64 e JSON, ~4x o arquivo cada). O excedente espera na fila. |
 
 ### Conexão e envio
 
@@ -284,8 +296,13 @@ sobe sem ela); todo o resto tem default.
 | `RECONNECT_DELAY_MS` | `30000` | Espera fixa entre tentativas. |
 | `CONNECTING_TIMEOUT_MS` | `45000` | Watchdog: força `/disconnect` se travar em `connecting` (`0` desativa). |
 | `MESSAGE_STATUS_TIMEOUT_MS` | `8000` | Quanto `/messages` espera pela confirmação real de entrega (`0` desativa). |
+| `HISTORY_SYNC` | `minimal` | Pacotes da sincronização de histórico que o Baileys baixa: `minimal` (só mapeamentos LID→número e nomes, sem histórico de mensagens), `off` (nada; o Baileys avisa de instabilidade) ou `recent` (default do Baileys, comportamento antigo). |
 | `BAILEYS_LOG_LEVEL` | `warn` | Logs internos do Baileys (pino JSON): `fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`. |
 | `CONNECTION_EVENTS_RETENTION_DAYS` | `30` | Dias de histórico em `wa_connection_events`. |
+| `NODE_MAX_OLD_SPACE_MB` | `1536` | Só do compose: vira `--max-old-space-size` (teto do heap do Node). Use ~75% do limite do container. |
+| `MEMORY_LOG_INTERVAL_MS` | `60000` | Intervalo da linha `memória: ...` no log (`0` desativa). |
+| `MEMORY_WARN_RATIO` | `0.7` | Fração do limite do heap do V8 **ou** da memória do container (RSS) a partir da qual a linha vira ALERTA com os suspeitos. |
+| `MEMORY_ALERT_INTERVAL_MS` | `10000` | Intervalo das leituras enquanto em ALERTA (mínimo `1000`). |
 
 `RECONNECT_MAX_ATTEMPTS` e `RECONNECT_DELAY_MS` são validados no boot: valor
 inválido faz o servidor recusar subir (em vez de desativar o limite sem aviso).
@@ -304,6 +321,7 @@ inválido faz o servidor recusar subir (em vez de desativar o limite sem aviso).
 | `WEBHOOK_MEDIA_MAX_BYTES` | `20971520` | Acima disso (20MB) a mídia não é embutida (`base64Error: "too_large"`). |
 | `WEBHOOK_MEDIA_TIMEOUT_MS` | `30000` | Timeout do download de mídia. |
 | `WEBHOOK_MEDIA_CACHE_MAX_BYTES` | `104857600` | Teto do cache de mídia em memória (100MB). |
+| `WEBHOOK_MEDIA_CONCURRENCY` | `3` | Entregas com mídia montando/enviando ao mesmo tempo (download, base64, JSON e POST, ~5x o arquivo cada). As outras esperam; entregas sem mídia não entram nessa fila. |
 | `WEBHOOK_DELIVERY_RETENTION_DAYS` | `7` | Dias de histórico de entregas concluídas. |
 | `WEBHOOK_HEADERS_KEY` | vazio | Chave da cifra dos cabeçalhos no banco (vazio = derivada da `API_KEY`). Ver [Segurança](#segurança). |
 
@@ -859,7 +877,10 @@ mídia).
   proteja o acesso ao banco.
 - **Corpo das requisições:** só é lido depois da API key; apenas as rotas de
   mídia aceitam até `JSON_BODY_LIMIT`, as demais até 256kb. JSON inválido ou
-  grande demais responde `400`/`413` no formato `{ "error" }`.
+  grande demais responde `400`/`413` no formato `{ "error" }`. Nas rotas de
+  mídia, no máximo `MEDIA_UPLOAD_CONCURRENCY` corpos grandes são lidos ao mesmo
+  tempo; o excedente espera na fila e, passado `MEDIA_UPLOAD_QUEUE_TIMEOUT_MS`,
+  recebe `503` com `Retry-After` (reenvie depois desse tempo).
 - `/manager` é servido com CSP restritivo (`script-src 'self'`) e
   `X-Frame-Options: DENY`.
 
@@ -947,6 +968,69 @@ cai com frequência, suba temporariamente para `info` ou `debug`. Os dumps de
 sessão de sinal que o libsignal imprime (`Closing session: SessionEntry {...}`,
 com chaves privadas) são descartados.
 
+Status (`status@broadcast`) é descartado pelo Baileys antes de decifrar
+(`shouldIgnoreJid`): a bridge não repassa nem envia status. Antes disso, cada
+status de um contato cuja chave o aparelho não tinha (comum logo depois de
+parear) gerava duas linhas de nível 50, `transaction failed, rolling back` e
+`failed to decrypt message ... No session found to decrypt message` com
+`messageType=skmsg sender=status@broadcast`, mais um pedido de reenvio ao
+celular do autor. Era inofensivo, mas trabalho e ruído à toa. Se essas linhas
+aparecerem para um `remoteJid` que **não** é `status@broadcast` (conversa ou
+grupo), aí sim é mensagem real que não foi decifrada.
+
+### Diagnóstico de memória
+
+Um estouro de heap do V8 (`FatalProcessOutOfMemory`, seguido de uma pilha de
+`v8::internal::...`) derruba o processo sem passar por nenhum handler de JS e
+não deixa o motivo no log. Por isso a bridge registra, antes, o que está
+segurando memória. Na subida:
+
+```
+memória: monitor ativo — limite do heap do V8 = 1584MB, limite do container = 2048MB, leitura a cada 60s (a cada 10s acima de 70%)
+```
+
+E, a cada `MEMORY_LOG_INTERVAL_MS`:
+
+```
+memória: rss=812/2048MB (40%) heap=640/1584MB (40%) Δheap=+120MB old=500MB grandes=90MB novos=30MB fora-do-heap=40MB buffers=30MB eventLoopP99=12ms sessões={connected=2,qr=1} enviadas-em-cache=200 mídia={cache=12MB/3,downloads=1+0} grupos={cache=450,metadata=80,participantes=9000} webhooks-em-voo=2 webhooks-mídia=1+0 envios-mídia=0+0 recebidas=30 histórico={mensagens=12000,conversas=300,contatos=800}
+```
+
+Como ler:
+
+| Campo | O que indica |
+|---|---|
+| `rss=usado/container` | Memória real do processo contra o limite do container (lido do cgroup). Se chegar a 100%, o kernel mata o container (`OOMKilled`) sem log nenhum: por isso também dispara o ALERTA. |
+| `heap=usado/limite` | Quanto do teto do V8 já foi usado. Inclui lixo ainda não coletado: um pico que volta é normal, **subir sem voltar** não é. |
+| `Δheap` | Variação desde a leitura anterior. Salto grande de uma linha pra outra mostra *quando* começou. |
+| `grandes` | Objetos enormes (strings/arrays). Alto = mídia em base64 ou JSON de webhook com mídia. |
+| `fora-do-heap` / `buffers` | Memória que o heap não vê: mídia baixada, criptografia. |
+| `mídia`, `grupos`, `enviadas-em-cache` | O que os caches da própria bridge seguram. |
+| `webhooks-mídia` / `envios-mídia` / `base64-mídia` | Vagas de mídia ocupadas + fila: webhooks montando/enviando mídia (`WEBHOOK_MEDIA_CONCURRENCY`), `POST /messages` com mídia (`MEDIA_UPLOAD_CONCURRENCY`) e `getBase64FromMediaMessage` (`MEDIA_BASE64_CONCURRENCY`). Fila crescendo = mais mídia chegando do que a bridge processa. |
+| `histórico` | Mensagens que o WhatsApp mandou na sincronização inicial, por leitura. Com `HISTORY_SYNC=minimal` só chegam os pacotes iniciais pequenos; números altos aqui com `recent` explicam pico logo depois de parear. Cada pacote também sai em `[<número>] histórico recebido: ...`. |
+| `recebidas` | Mensagens novas (`messages.upsert`) desde a leitura anterior. |
+| `eventLoopP99` | Atraso do event loop: GC pesado ou trabalho síncrono grande. |
+
+Acima de `MEMORY_WARN_RATIO` do limite do heap **ou** da memória do container, a linha vira `memória: ALERTA ...` (dizendo qual dos dois), as
+leituras passam a sair a cada `MEMORY_ALERT_INTERVAL_MS` e vêm linhas
+`memória: suspeito: ...` apontando onde olhar (mídia, histórico, grupos, muitas
+sessões). Se nenhum contador da bridge explicar o uso, o suspeito é retenção
+dentro do Baileys ou do driver do Postgres.
+
+Quando o processo morrer, as **últimas linhas `memória:` antes do crash** são a
+evidência: veja qual campo crescia e o que `Δheap` mostrava.
+
+Para uma prova definitiva (o que, objeto por objeto, ocupa o heap), suba uma
+vez com um heap snapshot automático perto do limite:
+
+```
+NODE_OPTIONS=--max-old-space-size=1536 --heapsnapshot-near-heap-limit=1 --diagnostic-dir=/tmp
+```
+
+O arquivo `.heapsnapshot` cai em `/tmp` do container (some no restart: copie com
+`docker cp` antes) e abre no Chrome DevTools, aba *Memory*. Atenção: gerar o
+snapshot precisa de memória extra (do tamanho do heap) e o arquivo **contém
+mensagens e chaves da sessão**: não o compartilhe. Não deixe ligado em produção.
+
 ---
 
 ## Decisões de design e limitações
@@ -976,7 +1060,18 @@ com chaves privadas) são descartados.
 - **`unhandledRejection`/`uncaughtException` são logados, não derrubam o
   processo**: preferimos manter as outras sessões de pé.
 - **Sem `mediaUrl` no envio** (evita SSRF) e **sem histórico antigo**
-  (`syncFullHistory: false`).
+  (`syncFullHistory: false` e `HISTORY_SYNC=minimal`).
+- **Status ignorado na origem** (`shouldIgnoreJid`): o Baileys responde ao
+  servidor e descarta `status@broadcast` sem decifrar nem pedir reenvio.
+- **Histórico de mensagens desligado, mapeamentos LID mantidos**: com o
+  default do Baileys, logo depois de parear ele baixa o histórico recente e o
+  acumula inteiro no buffer de eventos até terminar (um objeto indexado pelo id
+  de cada mensagem), o que estourava o heap. `HISTORY_SYNC=minimal` recusa
+  `RECENT`, `FULL`, `ON_DEMAND` e o histórico de status, e aceita só
+  `INITIAL_BOOTSTRAP`, `PUSH_NAME` e `NON_BLOCKING_DATA`, que trazem os
+  mapeamentos LID→número iniciais. Desligar tudo (`off`) faz o Baileys avisar
+  de instabilidade; os mapeamentos ainda são aprendidos de cada mensagem
+  recebida e de cada envio. `recent` volta ao comportamento antigo.
 
 **Limitações conhecidas**
 
@@ -1032,6 +1127,8 @@ pela bridge com essas amostras (chaves e tipos).
   rotas REST.
 - [`docs/contracts/webhook-payload.md`](docs/contracts/webhook-payload.md):
   envelope e payload de cada evento de webhook.
+- [`CHANGELOG.md`](CHANGELOG.md): mudanças por versão e instruções de
+  atualização (variáveis novas, passo a passo, rollback).
 - [`docs/revisoes-de-codigo.md`](docs/revisoes-de-codigo.md): histórico das
   revisões de código e dos testes reais feitos durante o desenvolvimento
   (incluindo o que **não** foi verificado de ponta a ponta).

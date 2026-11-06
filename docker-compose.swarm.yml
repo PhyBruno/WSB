@@ -38,6 +38,11 @@ services:
       ## Servidor
       - PORT=3000
       - JSON_BODY_LIMIT=20mb
+      ## Envios com mídia (corpo grande) processados ao mesmo tempo e espera máxima na fila (depois, 503)
+      - MEDIA_UPLOAD_CONCURRENCY=${MEDIA_UPLOAD_CONCURRENCY:-5}
+      - MEDIA_UPLOAD_QUEUE_TIMEOUT_MS=${MEDIA_UPLOAD_QUEUE_TIMEOUT_MS:-30000}
+      ## getBase64FromMediaMessage montando a resposta ao mesmo tempo
+      - MEDIA_BASE64_CONCURRENCY=${MEDIA_BASE64_CONCURRENCY:-3}
       ## Banco de dados
       - DATABASE_URL=postgres://whatsapp_bridge:${POSTGRES_PASSWORD}@whatsapp_bridge_postgres:5432/whatsapp_bridge
       ## Autenticação (header x-api-key obrigatório em toda chamada)
@@ -64,6 +69,8 @@ services:
       - WEBHOOK_MEDIA_MAX_BYTES=${WEBHOOK_MEDIA_MAX_BYTES:-20971520}
       - WEBHOOK_MEDIA_TIMEOUT_MS=${WEBHOOK_MEDIA_TIMEOUT_MS:-30000}
       - WEBHOOK_MEDIA_CACHE_MAX_BYTES=${WEBHOOK_MEDIA_CACHE_MAX_BYTES:-104857600}
+      ## Webhooks com mídia montando/enviando ao mesmo tempo (os demais esperam a vez)
+      - WEBHOOK_MEDIA_CONCURRENCY=${WEBHOOK_MEDIA_CONCURRENCY:-3}
       ## Webhooks: dias de histórico de entregas concluídas
       - WEBHOOK_DELIVERY_RETENTION_DAYS=${WEBHOOK_DELIVERY_RETENTION_DAYS:-7}
       ## Cifra dos cabeçalhos dos webhooks no banco (vazio = derivada da API_KEY)
@@ -72,6 +79,8 @@ services:
       - MESSAGE_RETENTION_DAYS=${MESSAGE_RETENTION_DAYS:-0}
       ## Diagnóstico de quedas: nível dos logs do baileys e dias de wa_connection_events
       - BAILEYS_LOG_LEVEL=${BAILEYS_LOG_LEVEL:-warn}
+      ## Histórico do WhatsApp ao parear: minimal (sem mensagens antigas, só mapeamentos LID), off ou recent
+      - HISTORY_SYNC=${HISTORY_SYNC:-minimal}
       - CONNECTION_EVENTS_RETENTION_DAYS=${CONNECTION_EVENTS_RETENTION_DAYS:-30}
       ## Nome dos grupos (groupSubject): cache em memória, consulta ao WhatsApp e limites do histórico
       - GROUP_METADATA_TTL_MS=${GROUP_METADATA_TTL_MS:-21600000}
@@ -79,6 +88,11 @@ services:
       - GROUP_METADATA_TIMEOUT_MS=${GROUP_METADATA_TIMEOUT_MS:-3000}
       - GROUP_METADATA_HISTORY_MAX_LOOKUPS=${GROUP_METADATA_HISTORY_MAX_LOOKUPS:-10}
       - GROUP_METADATA_HISTORY_BUDGET_MS=${GROUP_METADATA_HISTORY_BUDGET_MS:-5000}
+      ## Memória: teto do heap do Node (deixe ~25% do limite do container pra Buffers) e diagnóstico
+      - NODE_OPTIONS=--max-old-space-size=${NODE_MAX_OLD_SPACE_MB:-1536}
+      - MEMORY_LOG_INTERVAL_MS=${MEMORY_LOG_INTERVAL_MS:-60000}
+      - MEMORY_ALERT_INTERVAL_MS=${MEMORY_ALERT_INTERVAL_MS:-10000}
+      - MEMORY_WARN_RATIO=${MEMORY_WARN_RATIO:-0.7}
     deploy:
       mode: replicated
       replicas: 1
@@ -95,7 +109,7 @@ services:
           memory: 128M
         limits:
           cpus: "0.5"
-          memory: 512M
+          memory: 2048M
       labels:
         - traefik.enable=1
         - traefik.http.routers.whatsapp_bridge_api.rule=Host(`yoururl.com.br`) ## Url da aplicação
