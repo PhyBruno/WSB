@@ -9,7 +9,15 @@
 // sincronizado, por sessão). Acima de MEMORY_WARN_RATIO do limite do heap a
 // linha vira ALERTA, sai com mais frequência e vem com os suspeitos prováveis.
 //
+// O alerta olha DUAS coisas: o heap do V8 contra o limite dele e o RSS do
+// processo contra o limite de memória do container (cgroup). A segunda existe
+// porque mídia vive quase toda fora do heap (Buffers e strings externas): no
+// teste de estresse, 10 webhooks com mídia de 20MB levaram o RSS a 1,5GB com
+// o heap em 20% — o kernel mataria o container (OOMKilled) sem nenhum alerta.
+//
 // Tudo é injetável pra dar pra testar sem esperar o V8 de verdade.
+import fs from 'node:fs'
+import os from 'node:os'
 import v8 from 'node:v8'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 
@@ -25,6 +33,28 @@ const BUFFER_SHARE = 0.3
 const HISTORY_MESSAGES_THRESHOLD = 1000
 const GROUP_PARTICIPANTS_THRESHOLD = 20_000
 
+// cgroup v2 e v1. "max" (v2) ou um valor absurdo (v1 sem limite usa ~2^63)
+// significam sem limite.
+const CGROUP_LIMIT_FILES = ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']
+
+/** Limite de memória do container em bytes, ou null quando não há limite. */
+export function readContainerMemoryLimit({ readFile = (file) => fs.readFileSync(file, 'utf-8'), totalMemory = os.totalmem() } = {}) {
+  for (const file of CGROUP_LIMIT_FILES) {
+    let raw
+    try {
+      raw = readFile(file).trim()
+    } catch {
+      continue
+    }
+    if (raw === 'max') return null
+    const bytes = Number(raw)
+    if (!Number.isFinite(bytes) || bytes <= 0) continue
+    // Limite maior que a memória da máquina = sem limite na prática.
+    return bytes >= totalMemory ? null : bytes
+  }
+  return null
+}
+
 /**
  * Lista os suspeitos prováveis a partir de um retrato (ver sample()). Pura.
  */
@@ -38,10 +68,13 @@ export function explainMemory(snapshot) {
         'strings/arrays enormes, típico de mídia em base64 ou do JSON de um webhook com mídia'
     )
   }
-  if (rssBytes > 0 && (externalBytes + arrayBuffersBytes) / rssBytes >= BUFFER_SHARE) {
+  // external já inclui arrayBuffers (e as strings externas, como o base64
+  // gerado de um Buffer).
+  const outside = Math.max(externalBytes ?? 0, arrayBuffersBytes ?? 0)
+  if (rssBytes > 0 && outside / rssBytes >= BUFFER_SHARE) {
     suspects.push(
-      `memória fora do heap = ${mb(Math.max(externalBytes, arrayBuffersBytes))}MB: ` +
-        'Buffers de mídia sendo baixada/decifrada ou cache de mídia'
+      `memória fora do heap = ${mb(outside)}MB: ` +
+        'Buffers e strings de mídia (download, base64, corpo de webhook ou de POST /messages)'
     )
   }
   if (app.media) {
@@ -51,6 +84,13 @@ export function explainMemory(snapshot) {
     if (app.media.active > 0 || app.media.waiting > 0) {
       suspects.push(`downloads de mídia: ${app.media.active} em andamento, ${app.media.waiting} na fila`)
     }
+  }
+  const webhookMedia = app.dispatcher?.media
+  if (webhookMedia && (webhookMedia.active > 0 || webhookMedia.waiting > 0)) {
+    suspects.push(`webhooks com mídia: ${webhookMedia.active} montando/enviando, ${webhookMedia.waiting} na fila`)
+  }
+  if (app.uploads && (app.uploads.active > 0 || app.uploads.waiting > 0)) {
+    suspects.push(`envios com mídia pela API: ${app.uploads.active} em andamento, ${app.uploads.waiting} na fila`)
   }
   const history = activity.history
   if (history && history.messages >= HISTORY_MESSAGES_THRESHOLD) {
@@ -92,7 +132,9 @@ function formatObject(object) {
 export function formatMemoryLine(snapshot) {
   const { heap, app = {}, activity = {} } = snapshot
   const parts = [
-    `rss=${mb(snapshot.rssBytes)}MB`,
+    snapshot.containerLimitBytes
+      ? `rss=${mb(snapshot.rssBytes)}/${mb(snapshot.containerLimitBytes)}MB (${Math.round(snapshot.rssRatio * 100)}%)`
+      : `rss=${mb(snapshot.rssBytes)}MB`,
     `heap=${mb(heap.usedBytes)}/${mb(heap.limitBytes)}MB (${Math.round(heap.ratio * 100)}%)`,
     `Δheap=${signed(mb(snapshot.heapDeltaBytes))}MB`,
     `old=${mb(heap.oldBytes)}MB`,
@@ -114,7 +156,11 @@ export function formatMemoryLine(snapshot) {
       `grupos={cache=${app.groups.groups},metadata=${app.groups.withMetadata},participantes=${app.groups.participants}}`
     )
   }
-  if (app.dispatcher) parts.push(`webhooks-em-voo=${app.dispatcher.inFlight}`)
+  if (app.dispatcher) {
+    parts.push(`webhooks-em-voo=${app.dispatcher.inFlight}`)
+    if (app.dispatcher.media) parts.push(`webhooks-mídia=${app.dispatcher.media.active}+${app.dispatcher.media.waiting}`)
+  }
+  if (app.uploads) parts.push(`envios-mídia=${app.uploads.active}+${app.uploads.waiting}`)
   if (activity.upsert) parts.push(`recebidas=${activity.upsert.messages}`)
   if (activity.history) {
     parts.push(`histórico={mensagens=${activity.history.messages},conversas=${activity.history.chats},contatos=${activity.history.contacts}}`)
@@ -132,6 +178,7 @@ export function createMemoryMonitor({
   heapStatistics = () => v8.getHeapStatistics(),
   heapSpaceStatistics = () => v8.getHeapSpaceStatistics(),
   eventLoop = monitorEventLoopDelay({ resolution: 20 }),
+  containerLimitBytes = readContainerMemoryLimit(),
   setTimer = setTimeout,
   clearTimer = clearTimeout
 } = {}) {
@@ -173,6 +220,8 @@ export function createMemoryMonitor({
 
     const snapshot = {
       rssBytes: usage.rss,
+      containerLimitBytes,
+      rssRatio: containerLimitBytes ? usage.rss / containerLimitBytes : 0,
       externalBytes: usage.external,
       arrayBuffersBytes: usage.arrayBuffers,
       heapDeltaBytes: previousHeapUsed == null ? 0 : usedBytes - previousHeapUsed,
@@ -189,7 +238,7 @@ export function createMemoryMonitor({
       activity
     }
     previousHeapUsed = usedBytes
-    lastRatio = snapshot.heap.ratio
+    lastRatio = Math.max(snapshot.heap.ratio, snapshot.rssRatio)
     activity = {}
     return snapshot
   }
@@ -198,8 +247,11 @@ export function createMemoryMonitor({
   function report() {
     const snapshot = sample()
     const line = formatMemoryLine(snapshot)
-    if (snapshot.heap.ratio >= warnRatio) {
-      log.warn(`memória: ALERTA heap acima de ${Math.round(warnRatio * 100)}% do limite — ${line}`)
+    const reasons = []
+    if (snapshot.heap.ratio >= warnRatio) reasons.push(`heap acima de ${Math.round(warnRatio * 100)}% do limite do V8`)
+    if (snapshot.rssRatio >= warnRatio) reasons.push(`processo acima de ${Math.round(warnRatio * 100)}% da memória do container`)
+    if (reasons.length) {
+      log.warn(`memória: ALERTA ${reasons.join(' e ')} — ${line}`)
       for (const suspect of explainMemory(snapshot)) log.warn(`memória: suspeito: ${suspect}`)
     } else {
       log.log(`memória: ${line}`)
@@ -233,6 +285,7 @@ export function createMemoryMonitor({
       const stats = heapStatistics()
       log.log(
         `memória: monitor ativo — limite do heap do V8 = ${mb(stats.heap_size_limit)}MB, ` +
+          (containerLimitBytes ? `limite do container = ${mb(containerLimitBytes)}MB, ` : 'container sem limite de memória, ') +
           `leitura a cada ${Math.round(intervalMs / 1000)}s (a cada ${Math.round(alertIntervalMs / 1000)}s acima de ${Math.round(warnRatio * 100)}%)`
       )
       // Uma leitura imediata dá a linha de base logo após o boot.

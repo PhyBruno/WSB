@@ -38,6 +38,9 @@ services:
       ## Servidor
       - PORT=3000
       - JSON_BODY_LIMIT=20mb
+      ## Envios com mídia (corpo grande) processados ao mesmo tempo e espera máxima na fila (depois, 503)
+      - MEDIA_UPLOAD_CONCURRENCY=${MEDIA_UPLOAD_CONCURRENCY:-5}
+      - MEDIA_UPLOAD_QUEUE_TIMEOUT_MS=${MEDIA_UPLOAD_QUEUE_TIMEOUT_MS:-30000}
       ## Banco de dados
       - DATABASE_URL=postgres://whatsapp_bridge:${POSTGRES_PASSWORD}@whatsapp_bridge_postgres:5432/whatsapp_bridge
       ## Autenticação (header x-api-key obrigatório em toda chamada)
@@ -64,6 +67,8 @@ services:
       - WEBHOOK_MEDIA_MAX_BYTES=${WEBHOOK_MEDIA_MAX_BYTES:-20971520}
       - WEBHOOK_MEDIA_TIMEOUT_MS=${WEBHOOK_MEDIA_TIMEOUT_MS:-30000}
       - WEBHOOK_MEDIA_CACHE_MAX_BYTES=${WEBHOOK_MEDIA_CACHE_MAX_BYTES:-104857600}
+      ## Webhooks com mídia montando/enviando ao mesmo tempo (os demais esperam a vez)
+      - WEBHOOK_MEDIA_CONCURRENCY=${WEBHOOK_MEDIA_CONCURRENCY:-3}
       ## Webhooks: dias de histórico de entregas concluídas
       - WEBHOOK_DELIVERY_RETENTION_DAYS=${WEBHOOK_DELIVERY_RETENTION_DAYS:-7}
       ## Cifra dos cabeçalhos dos webhooks no banco (vazio = derivada da API_KEY)

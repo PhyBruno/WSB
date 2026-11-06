@@ -448,3 +448,75 @@ test('retentativa depois de falha na consulta respeita o cache negativo', async 
   assert.equal(calls.length, 1, 'a retentativa não consulta o WhatsApp de novo dentro do cache negativo')
   assert.equal(deliveries[0].status, 'delivered')
 })
+
+// ---------------- mídia: vagas de montagem/envio ----------------
+
+const PEER_JID = '5511988887777@s.whatsapp.net'
+
+test('entregas com mídia: no máximo mediaConcurrency montando/enviando; sem mídia não espera vaga', async () => {
+  const deliveries = []
+  for (let i = 1; i <= 6; i++) {
+    deliveries.push({
+      id: i,
+      webhook_id: `w${i}`,
+      session_id: '5511900000001',
+      event: 'MESSAGES_UPSERT',
+      status: 'pending',
+      attempts: 0,
+      payload: { key: { remoteJid: PEER_JID, fromMe: false, id: `M${i}` }, messageType: 'imageMessage', message: { imageMessage: {} } }
+    })
+  }
+  deliveries.push(delivery(7, 'MESSAGES_UPSERT', PEER_JID))
+  deliveries[6].webhook_id = 'w7'
+
+  const pool = fakeOutbox(deliveries)
+  const claim = pool.query.bind(pool)
+  pool.query = async (sql, params) => {
+    const result = await claim(sql, params)
+    if (sql.includes('WITH claimed')) for (const row of result.rows) row.base64 = true
+    return result
+  }
+  const media = { download: async () => Buffer.from('arquivo') }
+  const dispatcher = createDispatcher({
+    pool,
+    cipher: noCipher,
+    config: { ...DISPATCHER_CONFIG, concurrency: 10, concurrencyPerWebhook: 10, mediaConcurrency: 2 },
+    media,
+    log: silentLog
+  })
+
+  const original = globalThis.fetch
+  let active = 0
+  let peak = 0
+  const release = []
+  const textPosted = []
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body)
+    if (!body.data.message.base64) {
+      textPosted.push(body.data.key.id)
+      return { status: 200, body: null }
+    }
+    active++
+    peak = Math.max(peak, active)
+    await new Promise((resolve) => release.push(resolve))
+    active--
+    return { status: 200, body: null }
+  }
+  try {
+    const batch = dispatcher.processBatch()
+    for (let i = 0; i < 50 && release.length < 2; i++) await new Promise((r) => setImmediate(r))
+    assert.equal(release.length, 2, 'só 2 entregas com mídia chegam ao POST')
+    assert.deepEqual(dispatcher.stats().media, { active: 2, waiting: 4, max: 2 })
+    assert.deepEqual(textPosted, ['K7'], 'a entrega sem mídia não ficou na fila')
+    while (deliveries.some((d) => d.status === 'delivering')) {
+      release.shift()?.()
+      await new Promise((r) => setImmediate(r))
+    }
+    await batch
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(peak, 2)
+  assert.ok(deliveries.every((d) => d.status === 'delivered'))
+  assert.deepEqual(dispatcher.stats().media, { active: 0, waiting: 0, max: 2 })
+})

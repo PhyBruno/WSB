@@ -56,6 +56,7 @@ import {
 } from './connectionEvents.js'
 import { createSessionLogout } from './sessionLogout.js'
 import { createMemoryMonitor } from './memoryMonitor.js'
+import { createConcurrencyLimiter, createUploadGate } from './limiter.js'
 
 // Antes de qualquer sessão abrir: o libsignal despeja chaves privadas no
 // stdout a cada sessão de sinal (ver connectionEvents.js).
@@ -169,6 +170,10 @@ const WEBHOOK_CONFIG = {
   mediaMaxBytes: numberFromEnv('WEBHOOK_MEDIA_MAX_BYTES', 20_971_520, { min: 0 }),
   mediaTimeoutMs: numberFromEnv('WEBHOOK_MEDIA_TIMEOUT_MS', 30_000, { min: 1 }),
   mediaCacheMaxBytes: numberFromEnv('WEBHOOK_MEDIA_CACHE_MAX_BYTES', 104_857_600, { min: 0 }),
+  // Entregas com mídia montando/enviando ao mesmo tempo (download + base64 +
+  // JSON + POST, ~5x o arquivo cada). As demais esperam a vez; entregas sem
+  // mídia não entram nessa fila.
+  mediaConcurrency: numberFromEnv('WEBHOOK_MEDIA_CONCURRENCY', 3, { min: 1, integer: true }),
   retentionDays: numberFromEnv('WEBHOOK_DELIVERY_RETENTION_DAYS', 7, { min: 1 })
 }
 
@@ -222,6 +227,15 @@ if (MEMORY_WARN_RATIO > 1) {
   console.error('ERRO: MEMORY_WARN_RATIO precisa estar entre 0.1 e 1 (fração do limite do heap).')
   process.exit(1)
 }
+
+// POST /messages e /message/sendButtons com corpo grande (mídia em base64)
+// processados ao mesmo tempo. Cada um custa ~2,5x o tamanho do corpo enquanto
+// é lido, parseado e decodificado: sem teto, 40 envios de 14MB simultâneos
+// levavam o processo a 1,5GB no teste de estresse. Quem passar do limite
+// espera até MEDIA_UPLOAD_QUEUE_TIMEOUT_MS na fila, sem o corpo ser lido; depois
+// disso recebe 503 com Retry-After. Envio de texto (corpo pequeno) não entra.
+const MEDIA_UPLOAD_CONCURRENCY = numberFromEnv('MEDIA_UPLOAD_CONCURRENCY', 5, { min: 1, integer: true })
+const MEDIA_UPLOAD_QUEUE_TIMEOUT_MS = numberFromEnv('MEDIA_UPLOAD_QUEUE_TIMEOUT_MS', 30_000, { min: 0 })
 
 // Nomes legíveis pro enum numérico do baileys (ERROR=0, PENDING=1,
 // SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5), pra devolver na API em vez
@@ -501,6 +515,8 @@ const dispatcher = createDispatcher({
 })
 const webhooks = createWebhookService({ pool, cipher: headerCipher, onEnqueue: () => dispatcher.wake() })
 
+const uploadSlots = createConcurrencyLimiter({ max: MEDIA_UPLOAD_CONCURRENCY })
+
 const memoryMonitor = createMemoryMonitor({
   intervalMs: MEMORY_LOG_INTERVAL_MS,
   alertIntervalMs: MEMORY_ALERT_INTERVAL_MS,
@@ -517,7 +533,8 @@ const memoryMonitor = createMemoryMonitor({
       sentMessages,
       media: media.stats(),
       groups: groups.stats(),
-      dispatcher: dispatcher.stats()
+      dispatcher: dispatcher.stats(),
+      uploads: uploadSlots.stats()
     }
   }
 })
@@ -1022,9 +1039,19 @@ app.use('/sessions', (req, res, next) => {
 const MEDIA_UPLOAD_ROUTE = /^\/[^/]+\/(messages|message\/sendButtons)\/?$/
 const largeJson = express.json({ limit: JSON_BODY_LIMIT })
 const smallJson = express.json({ limit: SMALL_JSON_LIMIT })
-app.use('/sessions', (req, res, next) =>
-  (req.method === 'POST' && MEDIA_UPLOAD_ROUTE.test(req.path) ? largeJson : smallJson)(req, res, next)
-)
+// Vaga de envio com mídia (MEDIA_UPLOAD_CONCURRENCY) ocupada antes de ler o
+// corpo: é a leitura que aloca. Corpo até o limite das rotas comuns não ocupa.
+const uploadGate = createUploadGate({
+  limiter: uploadSlots,
+  timeoutMs: MEDIA_UPLOAD_QUEUE_TIMEOUT_MS,
+  smallBodyBytes: 256 * 1024
+})
+app.use('/sessions', (req, res, next) => {
+  if (req.method === 'POST' && MEDIA_UPLOAD_ROUTE.test(req.path)) {
+    return uploadGate(req, res, (err) => (err ? next(err) : largeJson(req, res, next)))
+  }
+  smallJson(req, res, next)
+})
 
 // Configurações, histórico e webhooks por instância (webhookRoutes.js). Tem
 // que vir depois do middleware acima: herda a exigência de x-api-key.
@@ -1373,6 +1400,8 @@ async function main() {
   // sessões: entregas que sobraram de antes do restart já voltam a sair.
   dispatcher.start()
   memoryMonitor.start()
+  // Listas de participantes vencidas (metadataTtlMs) saem da memória.
+  setInterval(() => groups.sweep(), 60_000).unref()
   if (MESSAGE_RETENTION_DAYS > 0) startMessageRetention()
   startConnectionEventsRetention()
   // Bounded pelo timeout interno de resolveBaileysVersion — nunca trava o

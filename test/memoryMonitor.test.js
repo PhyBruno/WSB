@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createMemoryMonitor, explainMemory, formatMemoryLine } from '../memoryMonitor.js'
+import { createMemoryMonitor, explainMemory, formatMemoryLine, readContainerMemoryLimit } from '../memoryMonitor.js'
 
 const MB = 1024 * 1024
 
@@ -8,8 +8,8 @@ function fakeEventLoop() {
   return { count: 1, percentile: () => 12e6, reset() {}, enable() {}, disable() {} }
 }
 
-function harness({ used = 100, limit = 1000, spaces = {}, external = 10, buffers = 5, app = {} } = {}) {
-  const state = { used, limit, spaces, external, buffers, app }
+function harness({ used = 100, limit = 1000, spaces = {}, external = 10, buffers = 5, app = {}, rss, container = null } = {}) {
+  const state = { used, limit, spaces, external, buffers, app, rss }
   const lines = { log: [], warn: [], error: [] }
   const timers = []
   const monitor = createMemoryMonitor({
@@ -22,7 +22,8 @@ function harness({ used = 100, limit = 1000, spaces = {}, external = 10, buffers
       warn: (m) => lines.warn.push(m),
       error: (m) => lines.error.push(m)
     },
-    memoryUsage: () => ({ rss: (state.used + 50) * MB, heapUsed: state.used * MB, external: state.external * MB, arrayBuffers: state.buffers * MB }),
+    containerLimitBytes: container == null ? null : container * MB,
+    memoryUsage: () => ({ rss: (state.rss ?? state.used + 50) * MB, heapUsed: state.used * MB, external: state.external * MB, arrayBuffers: state.buffers * MB }),
     heapStatistics: () => ({ used_heap_size: state.used * MB, heap_size_limit: state.limit * MB }),
     heapSpaceStatistics: () =>
       Object.entries({ old_space: state.used, ...state.spaces }).map(([space_name, mbs]) => ({ space_name, space_used_size: mbs * MB })),
@@ -65,7 +66,7 @@ test('acima de MEMORY_WARN_RATIO vira ALERTA com suspeitos', () => {
   })
   monitor.report()
   assert.equal(lines.log.length, 0)
-  assert.match(lines.warn[0], /ALERTA heap acima de 70% do limite — rss=850MB heap=800\/1000MB \(80%\)/)
+  assert.match(lines.warn[0], /ALERTA heap acima de 70% do limite do V8 — rss=850MB heap=800\/1000MB \(80%\)/)
   const text = lines.warn.slice(1).join('\n')
   assert.match(text, /suspeito: objetos grandes = 400MB/)
   assert.match(text, /cache de mídia = 90MB em 4 item/)
@@ -130,7 +131,7 @@ test('start loga o limite do heap e é desligado com intervalo 0', () => {
   monitor.start()
   assert.match(lines.log[0], /limite do heap do V8 = 1536MB/)
 
-  const off = createMemoryMonitor({ intervalMs: 0, log: { log: () => assert.fail('não deveria logar') } })
+  const off = createMemoryMonitor({ intervalMs: 0, containerLimitBytes: null, log: { log: () => assert.fail('não deveria logar') } })
   off.start()
 })
 
@@ -144,7 +145,8 @@ test('falha nos contadores da aplicação não impede a leitura', () => {
     memoryUsage: () => ({ rss: MB, heapUsed: MB, external: 0, arrayBuffers: 0 }),
     heapStatistics: () => ({ used_heap_size: MB, heap_size_limit: 100 * MB }),
     heapSpaceStatistics: () => [],
-    eventLoop: fakeEventLoop()
+    eventLoop: fakeEventLoop(),
+    containerLimitBytes: null
   })
   broken.report()
   assert.match(lines.error[0], /falha ao coletar contadores da aplicação: boom/)
@@ -172,4 +174,70 @@ test('formatMemoryLine mostra mídia, grupos e webhooks', () => {
   assert.match(line, /grupos=\{cache=5,metadata=2,participantes=40\}/)
   assert.match(line, /webhooks-em-voo=4/)
   assert.doesNotMatch(line, /eventLoop/)
+})
+
+test('RSS perto do limite do container dispara ALERTA mesmo com o heap baixo (mídia fora do heap)', () => {
+  const { monitor, lines } = harness({
+    used: 300,
+    rss: 1500,
+    external: 900,
+    buffers: 600,
+    container: 2048,
+    app: { dispatcher: { inFlight: 10, media: { active: 3, waiting: 7 } } }
+  })
+  monitor.report()
+  assert.equal(lines.log.length, 0)
+  assert.match(lines.warn[0], /ALERTA processo acima de 70% da memória do container — rss=1500\/2048MB \(73%\) heap=300\/1000MB \(30%\)/)
+  const text = lines.warn.slice(1).join('\n')
+  assert.match(text, /memória fora do heap = 900MB/)
+  assert.match(text, /webhooks com mídia: 3 montando\/enviando, 7 na fila/)
+})
+
+test('heap e container altos ao mesmo tempo: o ALERTA cita os dois', () => {
+  const { monitor, lines } = harness({ used: 800, rss: 1900, container: 2048 })
+  monitor.report()
+  assert.match(lines.warn[0], /ALERTA heap acima de 70% do limite do V8 e processo acima de 70% da memória do container/)
+})
+
+test('o intervalo encurta quando o RSS passa do limite de alerta do container', () => {
+  const { monitor, state, timers } = harness({ used: 100, rss: 200, container: 1000 })
+  monitor.start()
+  assert.equal(timers.at(-1).ms, 60_000)
+  state.rss = 800
+  timers.at(-1).fn()
+  assert.equal(timers.at(-1).ms, 10_000)
+})
+
+test('start informa o limite do container', () => {
+  const { monitor, lines } = harness({ container: 2048 })
+  monitor.start()
+  assert.match(lines.log[0], /limite do container = 2048MB/)
+})
+
+test('envios com mídia pela API aparecem na linha e como suspeito', () => {
+  const app = { uploads: { active: 5, waiting: 2, max: 5 } }
+  const { monitor, lines } = harness({ used: 900, app })
+  monitor.report()
+  assert.match(lines.warn[0], /envios-mídia=5\+2/)
+  assert.match(lines.warn.join('\n'), /envios com mídia pela API: 5 em andamento, 2 na fila/)
+})
+
+test('readContainerMemoryLimit: cgroup v2, v1, "max" e sem cgroup', () => {
+  const files = (map) => (file) => {
+    if (file in map) return map[file]
+    throw new Error('ENOENT')
+  }
+  const total = 16 * 1024 * MB
+  assert.equal(readContainerMemoryLimit({ readFile: files({ '/sys/fs/cgroup/memory.max': '2147483648\n' }), totalMemory: total }), 2048 * MB)
+  assert.equal(readContainerMemoryLimit({ readFile: files({ '/sys/fs/cgroup/memory.max': 'max\n' }), totalMemory: total }), null)
+  assert.equal(
+    readContainerMemoryLimit({ readFile: files({ '/sys/fs/cgroup/memory/memory.limit_in_bytes': '536870912' }), totalMemory: total }),
+    512 * MB
+  )
+  // v1 sem limite: valor gigante (maior que a máquina)
+  assert.equal(
+    readContainerMemoryLimit({ readFile: files({ '/sys/fs/cgroup/memory/memory.limit_in_bytes': '9223372036854771712' }), totalMemory: total }),
+    null
+  )
+  assert.equal(readContainerMemoryLimit({ readFile: files({}), totalMemory: total }), null)
 })

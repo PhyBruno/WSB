@@ -418,3 +418,46 @@ test('onConnected descarta listas de participantes e o cache negativo da sessão
   assert.equal(await groups.cachedGroupMetadata(SESSION)(G1), undefined)
   assert.equal(await groups.getSubject(SESSION, G2), 'Voltou', 'cache negativo limpo na reconexão')
 })
+
+test('sweep tira da memória a lista de participantes vencida e o grupo vencido, sem ler de novo', async () => {
+  let clock = 1_000
+  const groups = cache({ config: { metadataTtlMs: 100, ttlMs: 1_000 }, now: () => clock })
+  const participants = Array.from({ length: 50 }, (_, i) => ({ id: `55119000000${i}@s.whatsapp.net` }))
+  await groups.onGroupsUpsert(SESSION, [
+    { id: G1, subject: 'Grupo Um', participants },
+    { id: G2, subject: 'Grupo Dois', participants }
+  ])
+  assert.deepEqual(groups.stats(), { groups: 2, withMetadata: 2, participants: 100, failures: 0, flights: 0 })
+
+  assert.deepEqual(groups.sweep(), { groupsRemoved: 0, metadataRemoved: 0 }, 'nada venceu ainda')
+  clock += 101
+  assert.deepEqual(groups.sweep(), { groupsRemoved: 0, metadataRemoved: 2 })
+  assert.deepEqual(groups.stats(), { groups: 2, withMetadata: 0, participants: 0, failures: 0, flights: 0 })
+  assert.equal(await groups.getSubject(SESSION, G1), 'Grupo Um', 'o nome continua em memória')
+
+  clock += 1_000
+  assert.deepEqual(groups.sweep(), { groupsRemoved: 2, metadataRemoved: 0 })
+  assert.equal(groups.stats().groups, 0)
+})
+
+test('sweep limpa o cache negativo vencido', async () => {
+  let clock = 1_000
+  const sock = fakeSocket(() => {
+    throw new Error('rate-overlimit')
+  })
+  const groups = cache({ sock, config: { failureTtlMs: 50 }, now: () => clock })
+  assert.equal(await groups.getSubject(SESSION, G1), null)
+  assert.equal(groups.stats().failures, 1)
+  clock += 51
+  groups.sweep()
+  assert.equal(groups.stats().failures, 0)
+})
+
+test('lista de participantes vencida sai da memória também quando o grupo é lido', async () => {
+  let clock = 1_000
+  const groups = cache({ config: { metadataTtlMs: 100 }, now: () => clock })
+  await groups.onGroupsUpsert(SESSION, [{ id: G1, subject: 'Grupo Um', participants: [{ id: PEER }] }])
+  clock += 101
+  assert.equal(await groups.getSubject(SESSION, G1), 'Grupo Um')
+  assert.equal(groups.stats().withMetadata, 0)
+})
