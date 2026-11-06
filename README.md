@@ -246,6 +246,13 @@ SHA curto do commit). Ajuste a regra `Host(...)` do router, defina
 `whatsapp_bridge_postgres_data` e a rede `network_public`. Atrás de proxy, o IP
 do cliente chega em `x-forwarded-for` / `x-real-ip`.
 
+### Atualizando de versão
+
+O [`CHANGELOG.md`](CHANGELOG.md) traz, para cada versão, o que muda de
+comportamento, as variáveis novas, o passo a passo (imagem, Swarm, Compose),
+como conferir que subiu certo e como voltar atrás. Leia antes de trocar a tag
+da imagem.
+
 ### Sobre a imagem
 
 - Base `node:22-slim` (glibc, não alpine): o Baileys puxa o `sharp` como
@@ -1120,6 +1127,8 @@ pela bridge com essas amostras (chaves e tipos).
   rotas REST.
 - [`docs/contracts/webhook-payload.md`](docs/contracts/webhook-payload.md):
   envelope e payload de cada evento de webhook.
+- [`CHANGELOG.md`](CHANGELOG.md): mudanças por versão e instruções de
+  atualização (variáveis novas, passo a passo, rollback).
 - [`docs/revisoes-de-codigo.md`](docs/revisoes-de-codigo.md): histórico das
   revisões de código e dos testes reais feitos durante o desenvolvimento
   (incluindo o que **não** foi verificado de ponta a ponta).
